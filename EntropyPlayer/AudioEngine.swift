@@ -384,8 +384,8 @@ final class AudioEngine {
             guard let self, let ch = buf.floatChannelData else { return }
             let n      = Int(buf.frameLength)
             let stereo = buf.format.channelCount > 1
-            self.satFilter.process(ch[0], count: n)
-            if stereo { self.satFilter.process(ch[1], count: n) }
+            self.satFilter.process(ch[0], count: n, channel: 0)
+            if stereo { self.satFilter.process(ch[1], count: n, channel: 1) }
             for i in 0..<n {
                 self.satRingL[self.satRingWrite & satMask] = ch[0][i]
                 self.satRingR[self.satRingWrite & satMask] = stereo ? ch[1][i] : ch[0][i]
