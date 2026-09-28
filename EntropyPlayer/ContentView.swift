@@ -269,6 +269,8 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 18) {
                 knobRow(key: "reverb", label: "Reverb",    sub: "Decay time",
                         display: { String(format: "%.1fs", pow($0/100, 2) * 20) })
+                knobRow(key: "gd",     label: "Grp Delay", sub: "Periods",
+                        display: { String(format: "%.1fx", $0/100*5) })
                 knobRow(key: "eq",     label: "Lo-Mid EQ", sub: "Gain",
                         display: { String(format: "%.1fdB", $0/100*12) })
                 knobRow(key: "sat",    label: "Saturator", sub: "Gain",

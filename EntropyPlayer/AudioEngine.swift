@@ -36,6 +36,9 @@ final class AudioEngine {
     // macro-to-loudness curve. Same tap → Swift DSP → ring → AVAudioSourceNode
     // bridge as the other stages.
     private let reverbFilter     = ConvolutionReverb()
+    // Frequency-dependent group delay (see GroupDelay.swift), run in the same
+    // preampMixer tap just ahead of the reverb.
+    private let groupDelay       = GroupDelay()
     private let reverbSinkMixer  = AVAudioMixerNode()
     private var reverbSourceNode: AVAudioSourceNode!
     private let reverbRingSize = 65536
@@ -123,6 +126,7 @@ final class AudioEngine {
         satFilter.setDrive(driveDb: 0)
         compressor.setSampleRate(44100)
         reverbFilter.setSampleRate(44100)
+        groupDelay.setSampleRate(44100)
 
         // Transparent until driven — same brickwall shape as the Limiter
         // mode, but this one is never user-switchable and always active,
@@ -339,6 +343,7 @@ final class AudioEngine {
             guard let self, let ch = buf.floatChannelData else { return }
             let n      = Int(buf.frameLength)
             let stereo = buf.format.channelCount > 1
+            self.groupDelay.process(left: ch[0], right: stereo ? ch[1] : nil, count: n)
             self.reverbFilter.process(left: ch[0], right: stereo ? ch[1] : nil, count: n)
             for i in 0..<n {
                 self.reverbRingL[self.reverbRingWrite & reverbMask] = ch[0][i]
@@ -463,6 +468,12 @@ final class AudioEngine {
         guard !skipUpdate else { return }
         let decaySec = Double(pow(eff, 1.5)) * 60
         reverbFilter.setDecay(decaySec)
+    }
+
+    /// Group delay: effective 0–1 → 0–5 periods of delay per frequency
+    /// (τ = scale / f, so full strength delays 20 Hz by 250 ms).
+    func setGroupDelay(effective eff: Float) {
+        groupDelay.setScale(Double(eff) * 5)
     }
 
     /// EQ: 0–12 dB, peaking bell at 150 Hz, Q 0.1 — matches the web edition exactly.

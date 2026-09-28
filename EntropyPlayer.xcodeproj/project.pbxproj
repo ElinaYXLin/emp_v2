@@ -19,6 +19,7 @@
 		AA2000000000000000000012 /* CustomDynamics.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000012 /* CustomDynamics.swift */; };
 		AA2000000000000000000013 /* CustomSaturator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000013 /* CustomSaturator.swift */; };
 		AA2000000000000000000014 /* ConvolutionReverb.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000014 /* ConvolutionReverb.swift */; };
+		AA2000000000000000000015 /* GroupDelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000015 /* GroupDelay.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -37,6 +38,7 @@
 		AA1000000000000000000012 /* CustomDynamics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomDynamics.swift; sourceTree = "<group>"; };
 		AA1000000000000000000013 /* CustomSaturator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomSaturator.swift; sourceTree = "<group>"; };
 		AA1000000000000000000014 /* ConvolutionReverb.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConvolutionReverb.swift; sourceTree = "<group>"; };
+		AA1000000000000000000015 /* GroupDelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupDelay.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -73,6 +75,7 @@
 				AA1000000000000000000012 /* CustomDynamics.swift */,
 				AA1000000000000000000013 /* CustomSaturator.swift */,
 				AA1000000000000000000014 /* ConvolutionReverb.swift */,
+				AA1000000000000000000015 /* GroupDelay.swift */,
 				AA1000000000000000000009 /* Info.plist */,
 				AA1000000000000000000010 /* EntropyPlayer.entitlements */,
 			);
@@ -167,6 +170,7 @@
 				AA2000000000000000000012 /* CustomDynamics.swift in Sources */,
 				AA2000000000000000000013 /* CustomSaturator.swift in Sources */,
 				AA2000000000000000000014 /* ConvolutionReverb.swift in Sources */,
+				AA2000000000000000000015 /* GroupDelay.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
