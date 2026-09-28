@@ -47,12 +47,24 @@ final class ConvolutionReverb {
         let rawLen   = max(Int(ceil(sr * floorSec)), Int(sr * 0.05))
         let capped   = max(1, min(rawLen, Int(sr * Self.maxIRSeconds)))
 
+        // Darker tail: the noise is run through a one-pole low-pass whose
+        // cutoff glides exponentially from 7 kHz at the onset down to 1.2 kHz
+        // by the end of the decay, so the reverb loses its highs as it fades
+        // (as real rooms do — air and soft surfaces absorb treble fastest)
+        // instead of ringing out as bright white-noise hiss.
+        let fStart = 7000.0, fEnd = 1200.0
         var irL = [Float](repeating: 0, count: capped)
         var irR = [Float](repeating: 0, count: capped)
+        var lpL = 0.0, lpR = 0.0
         for i in 0..<capped {
-            let env = Float(exp(-3.0 * Double(i) / (sr * floorSec)))
-            irL[i] = Float.random(in: -1...1) * env
-            irR[i] = Float.random(in: -1...1) * env
+            let t   = Double(i) / (sr * floorSec)
+            let env = exp(-3.0 * t)
+            let fc  = fStart * pow(fEnd / fStart, min(t, 1))
+            let a   = 1 - exp(-2 * Double.pi * fc / sr)
+            lpL += a * (Double.random(in: -1...1) - lpL)
+            lpR += a * (Double.random(in: -1...1) - lpR)
+            irL[i] = Float(lpL * env)
+            irR[i] = Float(lpR * env)
         }
 
         // Web Audio's ConvolverNode normalizes the impulse response's energy

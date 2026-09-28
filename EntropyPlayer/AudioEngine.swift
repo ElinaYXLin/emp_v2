@@ -53,7 +53,9 @@ final class AudioEngine {
     // edition uses. That mismatch produced a boomy artifact once the EQ's
     // bass boost drove it. Same tap → Swift DSP → ring → AVAudioSourceNode
     // bridge as the EQ and dynamics stages.
-    private let satFilter     = WebAudioSaturator()
+    private let satFilter     = WebAudioSaturator(voicing: .even)
+    private let oddSatFilter  = WebAudioSaturator(voicing: .odd)
+    private let highRolloff   = HighRolloff()
     private let satSinkMixer  = AVAudioMixerNode()
     private var satSourceNode: AVAudioSourceNode!
     private let satRingSize = 65536
@@ -124,6 +126,8 @@ final class AudioEngine {
         // initialized and can be captured.
         eqFilter.setParameters(frequency: 150, q: 0.1, gainDb: 0)
         satFilter.setDrive(driveDb: 0)
+        oddSatFilter.setDrive(driveDb: 0)
+        highRolloff.setSlope(dbPerOctave: 0)
         compressor.setSampleRate(44100)
         reverbFilter.setSampleRate(44100)
         groupDelay.setSampleRate(44100)
@@ -384,8 +388,16 @@ final class AudioEngine {
             guard let self, let ch = buf.floatChannelData else { return }
             let n      = Int(buf.frameLength)
             let stereo = buf.format.channelCount > 1
+            // Color stage: even saturator → odd saturator → high roll-off
+            // (after both, so it also tames the harmonics they add).
             self.satFilter.process(ch[0], count: n, channel: 0)
-            if stereo { self.satFilter.process(ch[1], count: n, channel: 1) }
+            self.oddSatFilter.process(ch[0], count: n, channel: 0)
+            self.highRolloff.process(ch[0], count: n, channel: 0)
+            if stereo {
+                self.satFilter.process(ch[1], count: n, channel: 1)
+                self.oddSatFilter.process(ch[1], count: n, channel: 1)
+                self.highRolloff.process(ch[1], count: n, channel: 1)
+            }
             for i in 0..<n {
                 self.satRingL[self.satRingWrite & satMask] = ch[0][i]
                 self.satRingR[self.satRingWrite & satMask] = stereo ? ch[1][i] : ch[0][i]
@@ -486,9 +498,19 @@ final class AudioEngine {
         eqFilter.setParameters(gainDb: Double(gainDb))
     }
 
-    /// Saturator: 0–8 dB drive, tanh soft-clip — matches the web edition exactly.
+    /// Even saturator: 0–8 dB drive, envelope-biased tanh (2nd/4th harmonics).
     func setSaturator(driveDb: Float) {
         satFilter.setDrive(driveDb: Double(driveDb))
+    }
+
+    /// Odd saturator: 0–8 dB drive, the web edition's plain tanh soft-clip.
+    func setOddSaturator(driveDb: Float) {
+        oddSatFilter.setDrive(driveDb: Double(driveDb))
+    }
+
+    /// High roll-off: 0–6 dB/octave slope above 1 kHz.
+    func setHighRolloff(dbPerOctave: Float) {
+        highRolloff.setSlope(dbPerOctave: Double(dbPerOctave))
     }
 
     enum DynamicsMode { case limiter, compressor }

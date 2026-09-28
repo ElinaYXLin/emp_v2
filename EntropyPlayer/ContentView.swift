@@ -266,21 +266,39 @@ struct ContentView: View {
     var macroPanel: some View {
         ZStack {
             panelBG
-            VStack(alignment: .leading, spacing: 18) {
-                knobRow(key: "reverb", label: "Reverb",    sub: "Decay time",
-                        display: { String(format: "%.1fs", pow($0/100, 2) * 20) })
-                knobRow(key: "gd",     label: "Grp Delay", sub: "Periods",
-                        display: { String(format: "%.1fx", $0/100*5) })
-                knobRow(key: "gdrand", label: "GD Random", sub: "Drift",
-                        display: { String(format: "±%.0f%%", $0/100*50) })
-                knobRow(key: "eq",     label: "Lo-Mid EQ", sub: "Gain",
-                        display: { String(format: "%.1fdB", $0/100*12) })
-                knobRow(key: "sat",    label: "Saturator", sub: "Gain",
-                        display: { String(format: "%.1fdB", $0/100*8) })
+            HStack(alignment: .top, spacing: 22) {
+                knobGroup("Color") {
+                    knobRow(key: "eq",      label: "Lo-Mid EQ", sub: "Gain",
+                            display: { String(format: "%.1fdB", $0/100*12) })
+                    knobRow(key: "sat",     label: "Even Sat",  sub: "Gain",
+                            display: { String(format: "%.1fdB", $0/100*8) })
+                    knobRow(key: "oddsat",  label: "Odd Sat",   sub: "Gain",
+                            display: { String(format: "%.1fdB", $0/100*8) })
+                    knobRow(key: "rolloff", label: "High Roll", sub: "dB/oct >1k",
+                            display: { String(format: "%.1fdB/oct", $0/100*6) })
+                }
+                knobGroup("Hazy") {
+                    knobRow(key: "reverb", label: "Reverb",    sub: "Decay time",
+                            display: { String(format: "%.1fs", pow($0/100, 2) * 20) })
+                    knobRow(key: "gd",     label: "Grp Delay", sub: "Periods",
+                            display: { String(format: "%.1fx", $0/100*5) })
+                    knobRow(key: "gdrand", label: "GD Random", sub: "Drift",
+                            display: { String(format: "±%.0f%%", $0/100*50) })
+                }
             }
             .padding(14)
         }
-        .frame(width: 260)
+        .frame(width: 500)
+    }
+
+    func knobGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text(title.uppercased())
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(Color(hex:"#d9d1bf").opacity(0.35))
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     @ViewBuilder

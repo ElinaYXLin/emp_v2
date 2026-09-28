@@ -23,7 +23,18 @@ import Foundation
 // than odd content, and ~15 dB less 3rd harmonic than the plain tanh at full
 // drive. The asymmetry produces a level-dependent DC offset, removed by a
 // 10 Hz DC blocker.
+//
+// Two voicings share this class: `.even` (the biased curve above) and `.odd`
+// (the web edition's original plain tanh, kept as its own "Odd Saturator"
+// control for a brighter, grittier edge).
 final class WebAudioSaturator {
+
+    enum Voicing { case even, odd }
+    private let voicing: Voicing
+
+    init(voicing: Voicing) {
+        self.voicing = voicing
+    }
 
     // Written from the main thread (macro/slider updates), read on the audio
     // thread. Updates are UI-rate, so an uncontended lock here is effectively free.
@@ -58,6 +69,16 @@ final class WebAudioSaturator {
         lock.lock()
         let drive = driveLin, tdrive = tanhDrive, post = postGain
         lock.unlock()
+
+        if voicing == .odd {
+            for i in 0..<count {
+                let xOrig   = Double(buffer[i])
+                let xScaled = xOrig * drive              // preGain
+                let y       = tanh(xScaled * drive) / tdrive  // waveshaper curve
+                buffer[i]   = Float(y * post)             // postGain
+            }
+            return
+        }
 
         let ch = min(max(channel, 0), 1)
         var e = env[ch], x1 = dcX[ch], y1 = dcY[ch]
