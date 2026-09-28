@@ -153,3 +153,34 @@ final class HighRolloff {
         x1[channel] = xs; y1[channel] = ys
     }
 }
+
+// Subsonic filter: 2nd-order Butterworth high-pass at 25 Hz, ahead of the
+// saturators. Inaudible sub-25 Hz rumble (from the source, or pushed around
+// by group delay) otherwise drives the saturators' operating point up and
+// down, audibly modulating everything else at the rumble rate.
+final class SubsonicFilter {
+    private let b0, b1, b2, a1, a2: Double
+    private var x1 = [0.0, 0.0], x2 = [0.0, 0.0], y1 = [0.0, 0.0], y2 = [0.0, 0.0]
+
+    init(cutoff: Double = 25, sampleRate: Double = 44100) {
+        // RBJ cookbook high-pass, Q = 1/√2 (Butterworth).
+        let w0 = 2 * Double.pi * cutoff / sampleRate
+        let alpha = sin(w0) / (2 * 0.7071067811865476)
+        let c = cos(w0), a0 = 1 + alpha
+        b0 = (1 + c) / 2 / a0; b1 = -(1 + c) / a0; b2 = b0
+        a1 = -2 * c / a0;      a2 = (1 - alpha) / a0
+    }
+
+    func process(_ buffer: UnsafeMutablePointer<Float>, count: Int, channel: Int) {
+        var x1 = self.x1[channel], x2 = self.x2[channel]
+        var y1 = self.y1[channel], y2 = self.y2[channel]
+        for i in 0..<count {
+            let x0 = Double(buffer[i])
+            let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            x2 = x1; x1 = x0; y2 = y1; y1 = y0
+            buffer[i] = Float(y0)
+        }
+        self.x1[channel] = x1; self.x2[channel] = x2
+        self.y1[channel] = y1; self.y2[channel] = y2
+    }
+}

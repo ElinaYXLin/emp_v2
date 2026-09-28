@@ -28,6 +28,15 @@ final class ConvolutionReverb {
     // numpy.convolve before writing this).
     private var irReversedL: [Float] = [0]
     private var irReversedR: [Float] = [0]
+    private var irGen = 0
+    // Audio-thread-only state. History is kept at the maximum IR length at
+    // all times, so changing the decay never wipes the running tail, and a
+    // new IR is crossfaded in over one block (old IR's output → new IR's).
+    // Previously every knob movement resized/zeroed the history, cutting
+    // the tail off abruptly — a stutter for as long as the knob moved.
+    private var activeL: [Float] = [0]
+    private var activeR: [Float] = [0]
+    private var activeGen = 0
     private var historyL: [Float] = []
     private var historyR: [Float] = []
 
@@ -83,6 +92,7 @@ final class ConvolutionReverb {
         lock.lock()
         irReversedL = irL.reversed()
         irReversedR = irR.reversed()
+        irGen &+= 1
         lock.unlock()
     }
 
@@ -101,38 +111,55 @@ final class ConvolutionReverb {
         lock.lock()
         let irL = irReversedL
         let irR = irReversedR
+        let gen = irGen
+        let maxLen = max(1, Int(sampleRate * Self.maxIRSeconds))
         lock.unlock()
 
-        processChannel(left, count: count, ir: irL, history: &historyL)
+        let changed = gen != activeGen
+        processChannel(left, count: count, ir: irL, oldIR: changed ? activeL : nil,
+                       maxLen: maxLen, history: &historyL)
         if let right {
-            processChannel(right, count: count, ir: irR, history: &historyR)
+            processChannel(right, count: count, ir: irR, oldIR: changed ? activeR : nil,
+                           maxLen: maxLen, history: &historyR)
         }
+        activeL = irL; activeR = irR; activeGen = gen
     }
 
     private func processChannel(_ buffer: UnsafeMutablePointer<Float>, count: Int,
-                                 ir: [Float], history: inout [Float]) {
-        let p = ir.count
-        guard p > 0 else { return }
-
-        // The IR can change length whenever the reverb knob moves (setDecay,
-        // main thread). Detect that here, on the audio thread, and resize our
-        // own history — avoids any cross-thread race on this state.
-        if history.count != p - 1 {
-            history = [Float](repeating: 0, count: max(0, p - 1))
+                                 ir: [Float], oldIR: [Float]?, maxLen: Int,
+                                 history: inout [Float]) {
+        if history.count != maxLen - 1 {
+            history = [Float](repeating: 0, count: maxLen - 1)
         }
 
         var a = history
         a.append(contentsOf: UnsafeBufferPointer(start: buffer, count: count))
 
-        var wet = [Float](repeating: 0, count: count)
-        ir.withUnsafeBufferPointer { irPtr in
-            a.withUnsafeBufferPointer { aPtr in
-                vDSP_conv(aPtr.baseAddress!, 1, irPtr.baseAddress!, 1, &wet, 1,
-                          vDSP_Length(count), vDSP_Length(p))
+        // Convolve against the most recent (p-1) history samples + block.
+        func convolve(_ h: [Float]) -> [Float] {
+            let p = min(h.count, maxLen)
+            var out = [Float](repeating: 0, count: count)
+            guard p > 0 else { return out }
+            h.withUnsafeBufferPointer { hPtr in
+                a.withUnsafeBufferPointer { aPtr in
+                    vDSP_conv(aPtr.baseAddress! + (maxLen - p), 1,
+                              hPtr.baseAddress! + (h.count - p), 1, &out, 1,
+                              vDSP_Length(count), vDSP_Length(p))
+                }
+            }
+            return out
+        }
+
+        var wet = convolve(ir)
+        if let oldIR {
+            let prev = convolve(oldIR)
+            for i in 0..<count {
+                let t = Float(i + 1) / Float(count)
+                wet[i] = prev[i] + (wet[i] - prev[i]) * t
             }
         }
 
-        if p > 1 { history = Array(a.suffix(p - 1)) }
+        history = Array(a.suffix(maxLen - 1))
 
         for i in 0..<count {
             buffer[i] = buffer[i] * 0.6 + wet[i] * 0.8

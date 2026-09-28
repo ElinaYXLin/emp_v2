@@ -2,6 +2,7 @@ import AVFoundation
 import AudioToolbox
 import CoreAudio
 import AppKit
+import Accelerate
 
 // File-level C-callable render callback for the EarPods HAL Output unit.
 // It drives the main engine's manual-rendering block, so the entire DSP chain
@@ -29,54 +30,55 @@ final class AudioEngine {
     private let preampMixer  = AVAudioMixerNode()
     private let tapMixer     = AVAudioMixerNode()
 
-    // Custom convolution reverb bridge (see ConvolutionReverb.swift): replaces
+    // DSP bridge. AVAudioEngine can't host our custom Swift DSP as an
+    // in-graph effect under App Sandbox (custom AUAudioUnit lookup fails with
+    // -3000), so audio leaves the graph through a tap on preampMixer and
+    // re-enters through dspSourceNode, whose render callback runs the whole
+    // chain inline:
+    //   group delay → reverb → EQ → +7 dB → 25 Hz high-pass → even sat → odd sat → high roll-off
+    //   → limiter/compressor → post-gain → output ceiling
+    //
+    // This used to be four chained tap→ring→source-node bridges, one per
+    // stage. Taps deliver audio in ~100 ms chunks (4410 frames, whatever
+    // bufferSize is requested) and none of those rings kept a cushion, so
+    // any timing jitter — a reverb knob drag, or the capture and output
+    // devices' clocks drifting apart in System mode — left a gap at chunk
+    // boundaries: a ~10 Hz "tak-tak-tak" that the saturator made worse, and
+    // that never recovered. Now there is exactly one bridge (see JitterRing),
+    // it re-primes a proper cushion after any underrun, and the tap itself
+    // only copies samples, so its timing no longer depends on DSP load.
+    private let preampSink = AVAudioMixerNode()   // muted keep-alive for the tap
+    private var dspSourceNode: AVAudioSourceNode!
+    private let dspRing = JitterRing()
+    private static let maxRenderFrames = 4096
+    private var scratchL = [Float](repeating: 0, count: AudioEngine.maxRenderFrames)
+    private var scratchR = [Float](repeating: 0, count: AudioEngine.maxRenderFrames)
+
+    // Custom convolution reverb (see ConvolutionReverb.swift): replaces
     // AUReverb2, whose algorithmic comb/allpass decay scales completely
     // differently with decay-time than the web edition's real noise
     // convolution — no amount of parameter tuning matched the web app's
-    // macro-to-loudness curve. Same tap → Swift DSP → ring → AVAudioSourceNode
-    // bridge as the other stages.
+    // macro-to-loudness curve.
     private let reverbFilter     = ConvolutionReverb()
-    // Frequency-dependent group delay (see GroupDelay.swift), run in the same
-    // preampMixer tap just ahead of the reverb.
+    // Frequency-dependent group delay (see GroupDelay.swift), just ahead of
+    // the reverb.
     private let groupDelay       = GroupDelay()
-    private let reverbSinkMixer  = AVAudioMixerNode()
-    private var reverbSourceNode: AVAudioSourceNode!
-    private let reverbRingSize = 65536
-    private var reverbRingL = [Float](repeating: 0, count: 65536)
-    private var reverbRingR = [Float](repeating: 0, count: 65536)
-    private var reverbRingWrite = 0
-    private var reverbRingRead  = 0
 
-    // Custom saturator bridge (see CustomSaturator.swift): replaces Apple's
+    // Custom saturators (see CustomSaturator.swift): replace Apple's
     // AVAudioUnitDistortion, whose presets are built from ring-modulation,
     // decimation, and delay effects — not the plain tanh soft-clip the web
     // edition uses. That mismatch produced a boomy artifact once the EQ's
-    // bass boost drove it. Same tap → Swift DSP → ring → AVAudioSourceNode
-    // bridge as the EQ and dynamics stages.
+    // bass boost drove it.
     private let satFilter     = WebAudioSaturator(voicing: .even)
     private let oddSatFilter  = WebAudioSaturator(voicing: .odd)
     private let highRolloff   = HighRolloff()
-    private let satSinkMixer  = AVAudioMixerNode()
-    private var satSourceNode: AVAudioSourceNode!
-    private let satRingSize = 65536
-    private var satRingL = [Float](repeating: 0, count: 65536)
-    private var satRingR = [Float](repeating: 0, count: 65536)
-    private var satRingWrite = 0
-    private var satRingRead  = 0
+    private let subsonic      = SubsonicFilter()
 
-    // Custom dynamics bridge (see CustomDynamics.swift): replaces Apple's
+    // Custom dynamics (see CustomDynamics.swift): replaces Apple's
     // AUDynamicsProcessor, which sounds fundamentally different from Web
     // Audio's DynamicsCompressorNode (smooth/pumping vs. transients slipping
     // past into real distortion) no matter how its parameters are tuned.
-    // Same tap → Swift DSP → ring → AVAudioSourceNode bridge as the EQ.
     private let compressor    = WebAudioCompressor()
-    private let dynSinkMixer  = AVAudioMixerNode()
-    private var dynSourceNode: AVAudioSourceNode!
-    private let dynRingSize = 65536
-    private var dynRingL = [Float](repeating: 0, count: 65536)
-    private var dynRingR = [Float](repeating: 0, count: 65536)
-    private var dynRingWrite = 0
-    private var dynRingRead  = 0
 
     // Output ceiling: the Limiter/Compressor stage already targets peaks
     // close to 0 dBFS, so Post-Gain (applied after it, with no headroom
@@ -87,18 +89,9 @@ final class AudioEngine {
     // so pushing Post-Gain up compresses gracefully instead of clipping.
     private let outputCeiling = WebAudioCompressor()
 
-    // Custom peaking EQ bridge (see CustomEQ.swift): reverbEffect's tap is fed
-    // through PeakingBiquad in Swift, then re-enters the graph via eqSourceNode.
-    // eqSinkMixer is a muted branch that keeps reverbEffect part of the render
-    // graph (so its tap actually fires) without adding a second copy of the signal.
+    // Custom peaking EQ (see CustomEQ.swift): AVAudioUnitEQ can't reach the
+    // web edition's very wide Q 0.1 bell.
     private let eqFilter     = PeakingBiquad()
-    private let eqSinkMixer  = AVAudioMixerNode()
-    private var eqSourceNode: AVAudioSourceNode!
-    private let eqRingSize = 65536
-    private var eqRingL = [Float](repeating: 0, count: 65536)
-    private var eqRingR = [Float](repeating: 0, count: 65536)
-    private var eqRingWrite = 0
-    private var eqRingRead  = 0
 
     // Fixed, always-on +7 dB drive into the saturator/limiter. Not exposed as
     // a control — the visible Pre-Amp slider's "0 dB" position stays the web
@@ -240,191 +233,53 @@ final class AudioEngine {
     // MARK: - Graph setup
 
     private func buildGraph() {
-        let eqFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
-        let mask = eqRingSize - 1
+        let dspFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
 
-        eqSourceNode = AVAudioSourceNode(format: eqFormat) { [weak self] _, _, frameCount, abl in
+        dspSourceNode = AVAudioSourceNode(format: dspFormat) { [weak self] _, _, frameCount, abl in
             guard let self else { return noErr }
             let list = UnsafeMutableAudioBufferListPointer(abl)
-            for frame in 0..<Int(frameCount) {
-                let l: Float, r: Float
-                if self.eqRingWrite != self.eqRingRead {
-                    l = self.eqRingL[self.eqRingRead & mask]
-                    r = self.eqRingR[self.eqRingRead & mask]
-                    self.eqRingRead &+= 1
-                } else {
-                    l = 0; r = 0
+            var done = 0
+            let total = Int(frameCount)
+            while done < total {
+                let n = min(total - done, Self.maxRenderFrames)
+                self.scratchL.withUnsafeMutableBufferPointer { lb in
+                    self.scratchR.withUnsafeMutableBufferPointer { rb in
+                        let l = lb.baseAddress!, r = rb.baseAddress!
+                        self.dspRing.read(left: l, right: r, count: n)
+                        self.renderChain(left: l, right: r, count: n)
+                        if list.count > 0, let out = list[0].mData?.assumingMemoryBound(to: Float.self) {
+                            (out + done).assign(from: l, count: n)
+                        }
+                        if list.count > 1, let out = list[1].mData?.assumingMemoryBound(to: Float.self) {
+                            (out + done).assign(from: r, count: n)
+                        }
+                    }
                 }
-                if list.count > 0 { list[0].mData?.assumingMemoryBound(to: Float.self)[frame] = l }
-                if list.count > 1 { list[1].mData?.assumingMemoryBound(to: Float.self)[frame] = r }
+                done += n
             }
             return noErr
         }
 
-        let satMask = satRingSize - 1
-        satSourceNode = AVAudioSourceNode(format: eqFormat) { [weak self] _, _, frameCount, abl in
-            guard let self else { return noErr }
-            let list = UnsafeMutableAudioBufferListPointer(abl)
-            for frame in 0..<Int(frameCount) {
-                let l: Float, r: Float
-                if self.satRingWrite != self.satRingRead {
-                    l = self.satRingL[self.satRingRead & satMask]
-                    r = self.satRingR[self.satRingRead & satMask]
-                    self.satRingRead &+= 1
-                } else {
-                    l = 0; r = 0
-                }
-                if list.count > 0 { list[0].mData?.assumingMemoryBound(to: Float.self)[frame] = l }
-                if list.count > 1 { list[1].mData?.assumingMemoryBound(to: Float.self)[frame] = r }
-            }
-            return noErr
-        }
-
-        let dynMask = dynRingSize - 1
-        dynSourceNode = AVAudioSourceNode(format: eqFormat) { [weak self] _, _, frameCount, abl in
-            guard let self else { return noErr }
-            let list = UnsafeMutableAudioBufferListPointer(abl)
-            let g = self.postGainLinear
-            let n = Int(frameCount)
-
-            var blockL = [Float](repeating: 0, count: n)
-            var blockR = [Float](repeating: 0, count: n)
-            for i in 0..<n {
-                if self.dynRingWrite != self.dynRingRead {
-                    blockL[i] = self.dynRingL[self.dynRingRead & dynMask] * g
-                    blockR[i] = self.dynRingR[self.dynRingRead & dynMask] * g
-                    self.dynRingRead &+= 1
-                }
-            }
-            // Safety ceiling: catches any Post-Gain overs gracefully instead
-            // of letting them hard-clip at the final hardware conversion.
-            blockL.withUnsafeMutableBufferPointer { lPtr in
-                blockR.withUnsafeMutableBufferPointer { rPtr in
-                    self.outputCeiling.process(left: lPtr.baseAddress!, right: rPtr.baseAddress!, count: n)
-                }
-            }
-
-            for frame in 0..<n {
-                if list.count > 0 { list[0].mData?.assumingMemoryBound(to: Float.self)[frame] = blockL[frame] }
-                if list.count > 1 { list[1].mData?.assumingMemoryBound(to: Float.self)[frame] = blockR[frame] }
-            }
-            return noErr
-        }
-
-        let reverbMask = reverbRingSize - 1
-        reverbSourceNode = AVAudioSourceNode(format: eqFormat) { [weak self] _, _, frameCount, abl in
-            guard let self else { return noErr }
-            let list = UnsafeMutableAudioBufferListPointer(abl)
-            for frame in 0..<Int(frameCount) {
-                let l: Float, r: Float
-                if self.reverbRingWrite != self.reverbRingRead {
-                    l = self.reverbRingL[self.reverbRingRead & reverbMask]
-                    r = self.reverbRingR[self.reverbRingRead & reverbMask]
-                    self.reverbRingRead &+= 1
-                } else {
-                    l = 0; r = 0
-                }
-                if list.count > 0 { list[0].mData?.assumingMemoryBound(to: Float.self)[frame] = l }
-                if list.count > 1 { list[1].mData?.assumingMemoryBound(to: Float.self)[frame] = r }
-            }
-            return noErr
-        }
-
-        for n in [player, preampMixer, reverbSinkMixer, reverbSourceNode, eqSinkMixer, eqSourceNode,
-                  satSinkMixer, satSourceNode, dynSinkMixer, dynSourceNode, tapMixer] as [AVAudioNode] {
+        for n in [player, preampMixer, preampSink, dspSourceNode, tapMixer] as [AVAudioNode] {
             engine.attach(n)
         }
-        engine.connect(player,       to: preampMixer,  format: nil)
+        engine.connect(player, to: preampMixer, format: nil)
 
         // preampMixer's only downstream connection is this muted sink — it
         // keeps preampMixer part of the render graph (so its tap fires)
-        // without adding a second, un-reverbed copy of the signal.
-        engine.connect(preampMixer, to: reverbSinkMixer, format: eqFormat)
-        reverbSinkMixer.outputVolume = 0
-        engine.connect(reverbSinkMixer, to: engine.mainMixerNode, format: nil)
+        // without adding a second, unprocessed copy of the signal.
+        engine.connect(preampMixer, to: preampSink, format: dspFormat)
+        preampSink.outputVolume = 0
+        engine.connect(preampSink, to: engine.mainMixerNode, format: nil)
 
-        preampMixer.installTap(onBus: 0, bufferSize: 256, format: eqFormat) { [weak self] buf, _ in
+        // The tap only copies — all DSP happens in dspSourceNode's render.
+        preampMixer.installTap(onBus: 0, bufferSize: 256, format: dspFormat) { [weak self] buf, _ in
             guard let self, let ch = buf.floatChannelData else { return }
-            let n      = Int(buf.frameLength)
             let stereo = buf.format.channelCount > 1
-            self.groupDelay.process(left: ch[0], right: stereo ? ch[1] : nil, count: n)
-            self.reverbFilter.process(left: ch[0], right: stereo ? ch[1] : nil, count: n)
-            for i in 0..<n {
-                self.reverbRingL[self.reverbRingWrite & reverbMask] = ch[0][i]
-                self.reverbRingR[self.reverbRingWrite & reverbMask] = stereo ? ch[1][i] : ch[0][i]
-                self.reverbRingWrite &+= 1
-            }
+            self.dspRing.write(left: ch[0], right: stereo ? ch[1] : ch[0], count: Int(buf.frameLength))
         }
 
-        // reverbSourceNode's only downstream connection is this muted sink —
-        // same keep-alive trick, so its tap fires and the custom EQ gets
-        // driven every render cycle.
-        engine.connect(reverbSourceNode, to: eqSinkMixer, format: eqFormat)
-        eqSinkMixer.outputVolume = 0
-        engine.connect(eqSinkMixer, to: engine.mainMixerNode, format: nil)
-
-        reverbSourceNode.installTap(onBus: 0, bufferSize: 256, format: eqFormat) { [weak self] buf, _ in
-            guard let self, let ch = buf.floatChannelData else { return }
-            let n      = Int(buf.frameLength)
-            let stereo = buf.format.channelCount > 1
-            self.eqFilter.process(ch[0], count: n, channel: 0)
-            if stereo { self.eqFilter.process(ch[1], count: n, channel: 1) }
-            let g = self.preLimiterGainLinear
-            for i in 0..<n {
-                self.eqRingL[self.eqRingWrite & mask] = ch[0][i] * g
-                self.eqRingR[self.eqRingWrite & mask] = (stereo ? ch[1][i] : ch[0][i]) * g
-                self.eqRingWrite &+= 1
-            }
-        }
-
-        // eqSourceNode's only downstream connection is this muted sink — same
-        // keep-alive trick, so its tap fires and the custom saturator gets
-        // driven every render cycle.
-        engine.connect(eqSourceNode, to: satSinkMixer, format: eqFormat)
-        satSinkMixer.outputVolume = 0
-        engine.connect(satSinkMixer, to: engine.mainMixerNode, format: nil)
-
-        eqSourceNode.installTap(onBus: 0, bufferSize: 256, format: eqFormat) { [weak self] buf, _ in
-            guard let self, let ch = buf.floatChannelData else { return }
-            let n      = Int(buf.frameLength)
-            let stereo = buf.format.channelCount > 1
-            // Color stage: even saturator → odd saturator → high roll-off
-            // (after both, so it also tames the harmonics they add).
-            self.satFilter.process(ch[0], count: n, channel: 0)
-            self.oddSatFilter.process(ch[0], count: n, channel: 0)
-            self.highRolloff.process(ch[0], count: n, channel: 0)
-            if stereo {
-                self.satFilter.process(ch[1], count: n, channel: 1)
-                self.oddSatFilter.process(ch[1], count: n, channel: 1)
-                self.highRolloff.process(ch[1], count: n, channel: 1)
-            }
-            for i in 0..<n {
-                self.satRingL[self.satRingWrite & satMask] = ch[0][i]
-                self.satRingR[self.satRingWrite & satMask] = stereo ? ch[1][i] : ch[0][i]
-                self.satRingWrite &+= 1
-            }
-        }
-
-        // satSourceNode's only downstream connection is this muted sink, same
-        // keep-alive trick, so its tap fires and the custom compressor
-        // (WebAudioCompressor) gets driven every render cycle.
-        engine.connect(satSourceNode, to: dynSinkMixer, format: eqFormat)
-        dynSinkMixer.outputVolume = 0
-        engine.connect(dynSinkMixer, to: engine.mainMixerNode, format: nil)
-
-        satSourceNode.installTap(onBus: 0, bufferSize: 256, format: eqFormat) { [weak self] buf, _ in
-            guard let self, let ch = buf.floatChannelData else { return }
-            let n      = Int(buf.frameLength)
-            let stereo = buf.format.channelCount > 1
-            self.compressor.process(left: ch[0], right: stereo ? ch[1] : nil, count: n)
-            for i in 0..<n {
-                self.dynRingL[self.dynRingWrite & dynMask] = ch[0][i]
-                self.dynRingR[self.dynRingWrite & dynMask] = stereo ? ch[1][i] : ch[0][i]
-                self.dynRingWrite &+= 1
-            }
-        }
-
-        engine.connect(dynSourceNode, to: tapMixer, format: eqFormat)
+        engine.connect(dspSourceNode, to: tapMixer, format: dspFormat)
         engine.connect(tapMixer,      to: engine.mainMixerNode, format: nil)
 
         tapMixer.installTap(onBus: 0, bufferSize: 512, format: nil) { [weak self] buf, _ in
@@ -434,6 +289,36 @@ final class AudioEngine {
         }
 
         try? engine.start()
+    }
+
+    /// The full DSP chain, in place, on the render thread.
+    private func renderChain(left l: UnsafeMutablePointer<Float>, right r: UnsafeMutablePointer<Float>, count n: Int) {
+        groupDelay.process(left: l, right: r, count: n)
+        reverbFilter.process(left: l, right: r, count: n)
+
+        eqFilter.process(l, count: n, channel: 0)
+        eqFilter.process(r, count: n, channel: 1)
+        var g = preLimiterGainLinear
+        vDSP_vsmul(l, 1, &g, l, 1, vDSP_Length(n))
+        vDSP_vsmul(r, 1, &g, r, 1, vDSP_Length(n))
+
+        // Color stage: subsonic cut → even saturator → odd saturator → high
+        // roll-off (after both, so it also tames the harmonics they add).
+        for (buf, ch) in [(l, 0), (r, 1)] {
+            subsonic.process(buf, count: n, channel: ch)
+            satFilter.process(buf, count: n, channel: ch)
+            oddSatFilter.process(buf, count: n, channel: ch)
+            highRolloff.process(buf, count: n, channel: ch)
+        }
+
+        compressor.process(left: l, right: r, count: n)
+
+        var pg = postGainLinear
+        vDSP_vsmul(l, 1, &pg, l, 1, vDSP_Length(n))
+        vDSP_vsmul(r, 1, &pg, r, 1, vDSP_Length(n))
+        // Safety ceiling: catches any Post-Gain overs gracefully instead
+        // of letting them hard-clip at the final hardware conversion.
+        outputCeiling.process(left: l, right: r, count: n)
     }
 
     private func setLowLatency() {
@@ -557,11 +442,10 @@ final class AudioEngine {
     private var captureSourceNode: AVAudioSourceNode?
     private var previousDefaultInputDevice: AudioDeviceID = 0
 
-    // ring1: capture tap → AVAudioSourceNode render callback (SPSC)
-    private let ringSize = 65536
-    private var ring = [Float](repeating: 0, count: 65536)
-    private var ringWrite = 0
-    private var ringRead  = 0
+    // ring1: capture tap → AVAudioSourceNode render callback. Cushioned
+    // (JitterRing) because the capture device (BlackHole) and the output
+    // device run on independent clocks, so the fill level slowly drifts.
+    private let captureRing = JitterRing()
 
     // The main engine's manual rendering block, called from the EarPods render thread.
     var manualRenderBlock: AVAudioEngineManualRenderingBlock?
@@ -649,23 +533,15 @@ final class AudioEngine {
 
         // ── AVAudioSourceNode feeds ring1 → DSP chain ─────────────────────────
         // Stopped player produces silence, so preampMixer receives only srcNode.
-        let mask = ringSize - 1
-        ring = [Float](repeating: 0, count: ringSize)
-        ringWrite = 0; ringRead = 0
+        captureRing.reset()
+        dspRing.reset()
 
         let srcNode = AVAudioSourceNode(format: playFmt) { [weak self] _, _, frameCount, abl in
             guard let self else { return noErr }
             let list = UnsafeMutableAudioBufferListPointer(abl)
-            for frame in 0..<Int(frameCount) {
-                let s: Float
-                if self.ringWrite != self.ringRead {
-                    s = self.ring[self.ringRead & mask]
-                    self.ringRead &+= 1
-                } else {
-                    s = 0
-                }
-                for buf in list { buf.mData?.assumingMemoryBound(to: Float.self)[frame] = s }
-            }
+            guard let l = list.first?.mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+            let r = list.count > 1 ? list[1].mData?.assumingMemoryBound(to: Float.self) ?? l : l
+            self.captureRing.read(left: l, right: r, count: Int(frameCount))
             return noErr
         }
         engine.attach(srcNode)
@@ -680,10 +556,12 @@ final class AudioEngine {
             guard let self, let ch = buf.floatChannelData else { return }
             let n        = Int(buf.frameLength)
             let isStereo = buf.format.channelCount > 1
+            var mono = [Float](repeating: 0, count: n)
             for i in 0..<n {
-                let s: Float = isStereo ? (ch[0][i] + ch[1][i]) * 0.5 : ch[0][i]
-                self.ring[self.ringWrite & mask] = s
-                self.ringWrite &+= 1
+                mono[i] = isStereo ? (ch[0][i] + ch[1][i]) * 0.5 : ch[0][i]
+            }
+            mono.withUnsafeBufferPointer { m in
+                self.captureRing.write(left: m.baseAddress!, right: m.baseAddress!, count: n)
             }
         }
         try cEng.start()
@@ -839,5 +717,83 @@ final class AudioEngine {
               let file       = currentFile else { return 0 }
         let s = Double(playerTime.sampleTime) / file.processingFormat.sampleRate
         return max(0, s)
+    }
+}
+
+// MARK: - JitterRing
+//
+// Stereo single-producer/single-consumer ring between a tap (writer, which
+// delivers ~100 ms chunks on its own thread) and a render callback (reader,
+// a few ms at a time on the realtime thread). The reader only starts once a
+// cushion of `primeFrames` is buffered — more than one tap chunk plus
+// scheduling jitter — and after any underrun it outputs silence and re-primes
+// that full cushion, instead of trickling out samples the moment they arrive
+// (which is what left a gap at every chunk boundary before). If the writer
+// runs ahead (device clock drift), excess beyond `maxFrames` is dropped back
+// down to the cushion so latency can't grow without bound. Indices are
+// guarded by an uncontended lock (which also orders the sample writes before
+// the index update); sample copies happen outside it.
+final class JitterRing {
+    private static let size = 1 << 17                 // ~3 s at 44.1 kHz
+    private static let primeFrames = 4410 + 2048      // one tap chunk + ~46 ms
+    private static let maxFrames   = 4410 * 3 + 2048
+
+    // Raw storage (not Swift arrays): both threads touch it concurrently,
+    // and array copy-on-write/exclusivity semantics aren't safe for that.
+    private let bufL = UnsafeMutablePointer<Float>.allocate(capacity: JitterRing.size)
+    private let bufR = UnsafeMutablePointer<Float>.allocate(capacity: JitterRing.size)
+    private var writeIdx = 0
+    private var readIdx  = 0
+    private var priming  = true
+    private let lock = NSLock()
+
+    init() {
+        bufL.initialize(repeating: 0, count: Self.size)
+        bufR.initialize(repeating: 0, count: Self.size)
+    }
+
+    deinit {
+        bufL.deallocate()
+        bufR.deallocate()
+    }
+
+    func reset() {
+        lock.lock()
+        writeIdx = 0; readIdx = 0; priming = true
+        lock.unlock()
+    }
+
+    func write(left: UnsafePointer<Float>, right: UnsafePointer<Float>, count: Int) {
+        lock.lock()
+        let w = writeIdx
+        lock.unlock()
+        let mask = Self.size - 1
+        for i in 0..<count {
+            bufL[(w &+ i) & mask] = left[i]
+            bufR[(w &+ i) & mask] = right[i]
+        }
+        lock.lock()
+        writeIdx = w &+ count
+        let avail = writeIdx &- readIdx
+        if avail > Self.maxFrames { readIdx = writeIdx &- Self.primeFrames }
+        lock.unlock()
+    }
+
+    func read(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, count: Int) {
+        lock.lock()
+        let avail = writeIdx &- readIdx
+        if priming && avail >= Self.primeFrames { priming = false }
+        let n = priming ? 0 : min(count, avail)
+        let r0 = readIdx
+        readIdx = r0 &+ n
+        if n < count { priming = true }                // underrun → rebuild cushion
+        lock.unlock()
+
+        let mask = Self.size - 1
+        for i in 0..<n {
+            left[i]  = bufL[(r0 &+ i) & mask]
+            right[i] = bufR[(r0 &+ i) & mask]
+        }
+        for i in n..<count { left[i] = 0; right[i] = 0 }
     }
 }
