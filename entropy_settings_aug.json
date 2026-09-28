@@ -1,0 +1,1 @@
+{"macro":43.849431818181813,"ranges":{"sat":{"min":0,"max":100},"reverb":{"min":0,"max":100},"eq":{"min":0,"max":100}},"order":"alpha","dynamics":"limiter","sensitivity":{"sat":12.080078125,"reverb":31.345312499999999,"eq":50},"waveColor":"#34D6D0"}
