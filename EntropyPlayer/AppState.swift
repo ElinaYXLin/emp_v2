@@ -10,7 +10,7 @@ struct RangeValue: Codable { var min: Double = 0; var max: Double = 100 }
 struct AppSettings: Codable {
     var waveColor:    String = "#35d6d0"
     var macro:        Double = 0
-    var sensitivity:  [String: Double] = ["reverb": 70, "gd": 50, "gdrand": 50, "eq": 50, "sat": 50, "oddsat": 50, "rolloff": 50]
+    var sensitivity:  [String: Double] = ["reverb": 15, "gd": 25, "gdrand": 36, "eq": 24, "sat": 71, "oddsat": 22, "rolloff": 43]
     var ranges:       [String: RangeValue] = [
         "reverb": .init(), "gd": .init(), "gdrand": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init()
     ]
@@ -27,7 +27,7 @@ final class AppState: ObservableObject {
     @Published var macro: Double = 0              // 0–100
     @Published var preampDb: Double = 0           // -12…0
     @Published var postGainDb: Double = 0         // -24…24, final output volume trim/boost
-    @Published var sensitivity: [String: Double] = ["reverb": 70, "gd": 50, "gdrand": 50, "eq": 50, "sat": 50, "oddsat": 50, "rolloff": 50]
+    @Published var sensitivity: [String: Double] = ["reverb": 15, "gd": 25, "gdrand": 36, "eq": 24, "sat": 71, "oddsat": 22, "rolloff": 43]
     @Published var ranges: [String: RangeValue]  = ["reverb": .init(), "gd": .init(), "gdrand": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init()]
     @Published var waveColor: Color = Color(hex: "#35d6d0")
     @Published var dynamicsMode: AudioEngine.DynamicsMode = .limiter
