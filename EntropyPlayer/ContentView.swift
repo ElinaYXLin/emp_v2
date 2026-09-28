@@ -281,7 +281,7 @@ struct ContentView: View {
                     knobRow(key: "reverb", label: "Reverb",    sub: "Decay time",
                             display: { String(format: "%.1fs", pow($0/100, 2) * 20) })
                     knobRow(key: "gd",     label: "Grp Delay", sub: "Periods",
-                            display: { String(format: "%.1fx", $0/100*5) })
+                            display: { String(format: "%.1fx", $0/100*20) })
                     knobRow(key: "gdrand", label: "GD Random", sub: "Drift",
                             display: { String(format: "±%.0f%%", $0/100*50) })
                 }

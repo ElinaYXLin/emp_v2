@@ -367,10 +367,11 @@ final class AudioEngine {
         reverbFilter.setDecay(decaySec)
     }
 
-    /// Group delay: effective 0–1 → 0–5 periods of delay per frequency
-    /// (τ = scale / f, so full strength delays 20 Hz by 250 ms).
+    /// Group delay: effective 0–1 → 0–20 periods of delay per frequency
+    /// (τ = scale / f, so full strength delays 100 Hz by 200 ms), plus
+    /// spectral smear (see GroupDelay.swift).
     func setGroupDelay(effective eff: Float) {
-        groupDelay.setScale(Double(eff) * 5)
+        groupDelay.setScale(Double(eff) * 20)
     }
 
     /// Group delay randomness: effective 0–1 → ±0–50% drift around the scale.
