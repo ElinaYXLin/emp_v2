@@ -4,21 +4,24 @@ import CoreAudio
 import AppKit
 import Accelerate
 
-// File-level C-callable render callback for the EarPods HAL Output unit.
-// It drives the main engine's manual-rendering block, so the entire DSP chain
-// renders synchronously on this realtime thread straight into the EarPods buffer.
+// File-level C-callable callbacks for System mode's raw HAL units.
 // Non-capturing → implicitly @convention(c) → safe to pass as AURenderCallback.
-private let _earPodsRender: AURenderCallback = { refCon, _, _, _, numFrames, ioData in
+// Both run on CoreAudio's realtime I/O threads.
+
+// Capture (BlackHole) input unit: pull the just-captured frames and push
+// them into the capture ring.
+private let _captureInput: AURenderCallback = { refCon, ioActionFlags, inTimeStamp, inBusNumber, numFrames, _ in
+    let eng = Unmanaged<AudioEngine>.fromOpaque(refCon).takeUnretainedValue()
+    eng.captureInputArrived(flags: ioActionFlags, timeStamp: inTimeStamp, bus: inBusNumber, frames: numFrames)
+    return noErr
+}
+
+// Output device unit: read the capture ring and run the whole DSP chain
+// straight into the output buffer.
+private let _captureOutput: AURenderCallback = { refCon, _, _, _, numFrames, ioData in
     let eng = Unmanaged<AudioEngine>.fromOpaque(refCon).takeUnretainedValue()
     guard let ioData else { return noErr }
-    if let block = eng.manualRenderBlock {
-        var status: OSStatus = noErr
-        _ = block(numFrames, ioData, &status)
-    } else {
-        // No engine yet → output silence.
-        let list = UnsafeMutableAudioBufferListPointer(ioData)
-        for buf in list { memset(buf.mData, 0, Int(buf.mDataByteSize)) }
-    }
+    eng.renderCaptureOutput(ioData, frames: Int(numFrames))
     return noErr
 }
 
@@ -49,7 +52,10 @@ final class AudioEngine {
     // only copies samples, so its timing no longer depends on DSP load.
     private let preampSink = AVAudioMixerNode()   // muted keep-alive for the tap
     private var dspSourceNode: AVAudioSourceNode!
-    private let dspRing = JitterRing()
+    // Taps run on an ordinary (non-realtime) thread, so under system load a
+    // chunk can arrive well over 100 ms late — keep ~150 ms of slack beyond
+    // one chunk. (Latency only affects play/pause response here.)
+    private let dspRing = JitterRing(primeFrames: 4410 + 6615, maxFrames: 4410 * 4 + 6615)
     private static let maxRenderFrames = 4096
     private var scratchL = [Float](repeating: 0, count: AudioEngine.maxRenderFrames)
     private var scratchR = [Float](repeating: 0, count: AudioEngine.maxRenderFrames)
@@ -340,6 +346,7 @@ final class AudioEngine {
     /// Pre-amp: -12 dB to 0 dB
     func setPreamp(db: Float) {
         preampMixer.outputVolume = pow(10, db / 20)
+        preampLinear = pow(10, db / 20)
     }
 
     // Post-gain: applied last, in dynSourceNode's render callback — after
@@ -432,25 +439,35 @@ final class AudioEngine {
     private func applyLimiterMode() { setDynamics(mode: .limiter) }
 
     // MARK: - System audio capture
-    // Architecture — no shared hardware device, so nothing collides on BlackHole:
-    //   captureEngine (system default input = BlackHole) → ring1 → AVAudioSourceNode → DSP
-    //   main engine runs in MANUAL RENDERING mode → touches no hardware device at all
-    //   earPodsAU (raw HAL AUHAL → EarPods) render callback pulls the engine's
-    //     manualRenderingBlock, rendering the whole DSP chain straight into EarPods.
+    // Architecture — no AVAudioEngine and no taps in this path at all:
+    //   captureAU (raw HAL input unit bound to BlackHole) → realtime input
+    //     callback → captureRing (ResamplingRing)
+    //   outputAU (raw HAL output unit → chosen device) → realtime render
+    //     callback → captureRing.read (resampled to 44.1 kHz, drift-corrected)
+    //     → preamp → renderChain → output buffer
+    // The main AVAudioEngine is simply stopped while capturing.
+    //
+    // Previously capture went BlackHole → AVAudioEngine input tap → ring →
+    // manual-rendering engine → preampMixer tap → ring → DSP. Taps fire on an
+    // ordinary thread in ~100 ms chunks, so scheduling hiccups under load
+    // ran the rings dry, and nothing compensated for BlackHole's clock vs.
+    // the output device's clock — both showed up as periodic pops.
 
     private(set) var isSystemCapture = false
-    private var captureEngine: AVAudioEngine?
-    private var captureSourceNode: AVAudioSourceNode?
-    private var previousDefaultInputDevice: AudioDeviceID = 0
+    private var captureAU: AudioUnit?
+    private var outputAU: AudioUnit?
+    private let captureRing = ResamplingRing()
+    private var captureRate: Double = 44100
+    private var captureChannels = 2
+    private var captureABL: UnsafeMutableAudioBufferListPointer?
+    private static let maxCaptureFrames = 8192
+    private var preampLinear: Float = 1
 
-    // ring1: capture tap → AVAudioSourceNode render callback. Cushioned
-    // (JitterRing) because the capture device (BlackHole) and the output
-    // device run on independent clocks, so the fill level slowly drifts.
-    private let captureRing = JitterRing()
-
-    // The main engine's manual rendering block, called from the EarPods render thread.
-    var manualRenderBlock: AVAudioEngineManualRenderingBlock?
-    private var earPodsAU: AudioUnit?
+    // Waveform display in System mode (no tapMixer tap running): the output
+    // callback drops a snapshot here, a main-thread timer forwards it.
+    private let vizLock = NSLock()
+    private var vizSnapshot = [Float](repeating: 0, count: 256)
+    private var vizTimer: Timer?
 
     /// Enumerate all audio devices that have the given scope (input or output).
     private func listDevices(scope: AudioObjectPropertyScope) -> [(id: AudioDeviceID, name: String)] {
@@ -489,180 +506,188 @@ final class AudioEngine {
     func listOutputDevices() -> [(id: AudioDeviceID, name: String)] { listDevices(scope: kAudioDevicePropertyScopeOutput) }
 
     enum CaptureError: LocalizedError {
-        case noInputAudioUnit
+        case unit(String, OSStatus)
         var errorDescription: String? {
-            "Could not access the capture device's audio unit. Try toggling System off and on."
-        }
-    }
-
-    func startSystemCapture(inputDeviceID: AudioDeviceID, outputDeviceID: AudioDeviceID) throws {
-        // ── Tear down any previous session ─────────────────────────────────────
-        stopEarPodsOutput()
-        manualRenderBlock = nil
-        captureEngine?.inputNode.removeTap(onBus: 0)
-        captureEngine?.stop()
-        captureEngine = nil
-        player.stop()
-
-        // ── Capture engine: bind its input AUHAL DIRECTLY to BlackHole ─────────
-        // We do NOT change the system default input device (the sandbox blocks
-        // that → -10877). Setting kAudioOutputUnitProperty_CurrentDevice on the
-        // input node's own AUHAL is permitted by the audio-input entitlement.
-        let cEng    = AVAudioEngine()
-        let inNode  = cEng.inputNode
-        guard let inAU = inNode.audioUnit else { throw CaptureError.noInputAudioUnit }
-        var dev = inputDeviceID
-        AudioUnitSetProperty(inAU, kAudioOutputUnitProperty_CurrentDevice,
-                             kAudioUnitScope_Global, 0,
-                             &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
-
-        // Lock the whole chain to BlackHole's actual sample rate to avoid drift.
-        let captureFmt = inNode.inputFormat(forBus: 0)
-        let sr = captureFmt.sampleRate > 0 ? captureFmt.sampleRate : 44100
-        let playFmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 2)!
-
-        // ── Move the MAIN engine off all hardware, into manual rendering mode ──
-        engine.stop()
-        if let src = captureSourceNode {
-            engine.detach(src)
-            captureSourceNode = nil
-        }
-        if engine.isInManualRenderingMode {
-            engine.disableManualRenderingMode()
-        }
-        try engine.enableManualRenderingMode(.realtime, format: playFmt, maximumFrameCount: 4096)
-
-        // ── AVAudioSourceNode feeds ring1 → DSP chain ─────────────────────────
-        // Stopped player produces silence, so preampMixer receives only srcNode.
-        captureRing.reset()
-        dspRing.reset()
-
-        let srcNode = AVAudioSourceNode(format: playFmt) { [weak self] _, _, frameCount, abl in
-            guard let self else { return noErr }
-            let list = UnsafeMutableAudioBufferListPointer(abl)
-            guard let l = list.first?.mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-            let r = list.count > 1 ? list[1].mData?.assumingMemoryBound(to: Float.self) ?? l : l
-            self.captureRing.read(left: l, right: r, count: Int(frameCount))
-            return noErr
-        }
-        engine.attach(srcNode)
-        engine.connect(srcNode, to: preampMixer, format: playFmt)
-
-        try engine.start()
-        manualRenderBlock = engine.manualRenderingBlock
-        captureSourceNode = srcNode
-
-        // ── Start capture: BlackHole → ring1 ──────────────────────────────────
-        inNode.installTap(onBus: 0, bufferSize: 512, format: captureFmt) { [weak self] buf, _ in
-            guard let self, let ch = buf.floatChannelData else { return }
-            let n        = Int(buf.frameLength)
-            let isStereo = buf.format.channelCount > 1
-            var mono = [Float](repeating: 0, count: n)
-            for i in 0..<n {
-                mono[i] = isStereo ? (ch[0][i] + ch[1][i]) * 0.5 : ch[0][i]
+            if case let .unit(step, status) = self {
+                return "Audio device error (\(step): \(status)). Try toggling System off and on."
             }
-            mono.withUnsafeBufferPointer { m in
-                self.captureRing.write(left: m.baseAddress!, right: m.baseAddress!, count: n)
-            }
+            return nil
         }
-        try cEng.start()
-        captureEngine = cEng
-
-        // ── Raw HAL Output unit → EarPods; its callback drives manualRenderBlock ─
-        isSystemCapture = true
-        startEarPodsOutput(deviceID: outputDeviceID, sampleRate: sr)
     }
 
-    func stopSystemCapture() {
-        isSystemCapture = false
-
-        stopEarPodsOutput()
-        manualRenderBlock = nil
-
-        captureEngine?.inputNode.removeTap(onBus: 0)
-        captureEngine?.stop()
-        captureEngine = nil
-
-        // ── Return the main engine to normal hardware output ──────────────────
-        engine.stop()
-        if let src = captureSourceNode {
-            engine.detach(src)
-            captureSourceNode = nil
-        }
-        if engine.isInManualRenderingMode {
-            engine.disableManualRenderingMode()
-        }
-        try? engine.start()
+    private func check(_ status: OSStatus, _ step: String) throws {
+        if status != noErr { throw CaptureError.unit(step, status) }
     }
 
-    // MARK: - EarPods raw HAL Output unit
-
-    private func startEarPodsOutput(deviceID: AudioDeviceID, sampleRate: Double) {
-        stopEarPodsOutput()
-
+    private func makeHALUnit() throws -> AudioUnit {
         var desc = AudioComponentDescription(
             componentType:         kAudioUnitType_Output,
             componentSubType:      kAudioUnitSubType_HALOutput,
             componentManufacturer: kAudioUnitManufacturer_Apple,
             componentFlags: 0, componentFlagsMask: 0)
-        guard let comp = AudioComponentFindNext(nil, &desc) else { return }
-
+        guard let comp = AudioComponentFindNext(nil, &desc) else { throw CaptureError.unit("find HAL", -1) }
         var au: AudioUnit?
-        guard AudioComponentInstanceNew(comp, &au) == noErr, let au else { return }
+        try check(AudioComponentInstanceNew(comp, &au), "new HAL unit")
+        return au!
+    }
 
-        // Disable input bus — this unit is output-only.
-        var off: UInt32 = 0; var on: UInt32 = 1
-        AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO,
-                             kAudioUnitScope_Input,  1, &off, 4)
-        AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO,
-                             kAudioUnitScope_Output, 0, &on,  4)
-
-        // Route to the chosen output device (EarPods).
-        var dev = deviceID
-        let devSz = UInt32(MemoryLayout<AudioDeviceID>.size)
-        guard AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
-                                   kAudioUnitScope_Global, 0, &dev, devSz) == noErr else {
-            AudioComponentInstanceDispose(au)
-            return
-        }
-
-        // Client format: non-interleaved float32, stereo, at the capture sample rate.
-        var fmt = AudioStreamBasicDescription(
-            mSampleRate:       sampleRate,
+    private static func floatFormat(rate: Double, channels: Int) -> AudioStreamBasicDescription {
+        AudioStreamBasicDescription(
+            mSampleRate:       rate,
             mFormatID:         kAudioFormatLinearPCM,
             mFormatFlags:      kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved | kAudioFormatFlagIsPacked,
             mBytesPerPacket:   4,
             mFramesPerPacket:  1,
             mBytesPerFrame:    4,
-            mChannelsPerFrame: 2,
+            mChannelsPerFrame: UInt32(channels),
             mBitsPerChannel:   32,
             mReserved:         0)
-        let fmtSz = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat,
-                             kAudioUnitScope_Input, 0, &fmt, fmtSz)
-
-        // Install render callback (defined at file scope, no captures).
-        var cb = AURenderCallbackStruct(
-            inputProc:       _earPodsRender,
-            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
-        let cbSz = UInt32(MemoryLayout<AURenderCallbackStruct>.size)
-        AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback,
-                             kAudioUnitScope_Input, 0, &cb, cbSz)
-
-        guard AudioUnitInitialize(au) == noErr else {
-            AudioComponentInstanceDispose(au)
-            return
-        }
-        AudioOutputUnitStart(au)
-        earPodsAU = au
     }
 
-    private func stopEarPodsOutput() {
-        guard let au = earPodsAU else { return }
-        AudioOutputUnitStop(au)
-        AudioUnitUninitialize(au)
-        AudioComponentInstanceDispose(au)
-        earPodsAU = nil
+    func startSystemCapture(inputDeviceID: AudioDeviceID, outputDeviceID: AudioDeviceID) throws {
+        // ── Tear down any previous session; take the main engine offline ────
+        stopCaptureUnits()
+        player.stop()
+        engine.stop()
+        captureRing.reset()
+
+        // ── Input unit bound directly to BlackHole ──────────────────────────
+        // (Setting the unit's own current device is permitted by the
+        // audio-input entitlement; changing the system default input isn't.)
+        let inAU = try makeHALUnit()
+        captureAU = inAU
+        var on: UInt32 = 1, off: UInt32 = 0
+        try check(AudioUnitSetProperty(inAU, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &on, 4), "enable input")
+        try check(AudioUnitSetProperty(inAU, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &off, 4), "disable output")
+        var inDev = inputDeviceID
+        try check(AudioUnitSetProperty(inAU, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                       &inDev, UInt32(MemoryLayout<AudioDeviceID>.size)), "bind input device")
+
+        // Device-side format tells us BlackHole's actual rate/channels; the
+        // input side of AUHAL can't sample-rate convert, so we take that rate
+        // and resample ourselves in the ring.
+        var devFmt = AudioStreamBasicDescription()
+        var fmtSz = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        try check(AudioUnitGetProperty(inAU, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &devFmt, &fmtSz), "read input format")
+        captureRate = devFmt.mSampleRate > 0 ? devFmt.mSampleRate : 44100
+        captureChannels = max(1, min(2, Int(devFmt.mChannelsPerFrame)))
+        var clientIn = Self.floatFormat(rate: captureRate, channels: captureChannels)
+        try check(AudioUnitSetProperty(inAU, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1,
+                                       &clientIn, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "set input format")
+
+        // Preallocated capture buffers (no allocation on the realtime thread).
+        let abl = AudioBufferList.allocate(maximumBuffers: captureChannels)
+        for i in 0..<captureChannels {
+            abl[i] = AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(Self.maxCaptureFrames * 4),
+                                 mData: UnsafeMutableRawPointer.allocate(byteCount: Self.maxCaptureFrames * 4, alignment: 16))
+        }
+        captureABL = abl
+
+        var inCB = AURenderCallbackStruct(inputProc: _captureInput,
+                                          inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
+        try check(AudioUnitSetProperty(inAU, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
+                                       &inCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "set input callback")
+
+        // ── Output unit → chosen device, DSP runs in its render callback ────
+        let outAU = try makeHALUnit()
+        outputAU = outAU
+        try check(AudioUnitSetProperty(outAU, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &off, 4), "disable out-unit input")
+        try check(AudioUnitSetProperty(outAU, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &on, 4), "enable output")
+        var outDev = outputDeviceID
+        try check(AudioUnitSetProperty(outAU, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                       &outDev, UInt32(MemoryLayout<AudioDeviceID>.size)), "bind output device")
+        // The DSP chain is designed for 44.1 kHz; the output side of AUHAL
+        // converts to whatever rate the device runs at.
+        var clientOut = Self.floatFormat(rate: 44100, channels: 2)
+        try check(AudioUnitSetProperty(outAU, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0,
+                                       &clientOut, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "set output format")
+        var maxFrames = UInt32(Self.maxRenderFrames)
+        AudioUnitSetProperty(outAU, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFrames, 4)
+        var outCB = AURenderCallbackStruct(inputProc: _captureOutput,
+                                           inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
+        try check(AudioUnitSetProperty(outAU, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0,
+                                       &outCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "set render callback")
+
+        try check(AudioUnitInitialize(inAU), "init input")
+        try check(AudioUnitInitialize(outAU), "init output")
+        isSystemCapture = true
+        try check(AudioOutputUnitStart(inAU), "start input")
+        try check(AudioOutputUnitStart(outAU), "start output")
+
+        vizTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 20, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.vizLock.lock(); let snap = self.vizSnapshot; self.vizLock.unlock()
+            self.onSamples?(snap)
+        }
+    }
+
+    func stopSystemCapture() {
+        stopCaptureUnits()
+        // ── Return the main engine to normal hardware output ──────────────────
+        try? engine.start()
+    }
+
+    private func stopCaptureUnits() {
+        isSystemCapture = false
+        vizTimer?.invalidate(); vizTimer = nil
+        for au in [captureAU, outputAU].compactMap({ $0 }) {
+            AudioOutputUnitStop(au)
+            AudioUnitUninitialize(au)
+            AudioComponentInstanceDispose(au)
+        }
+        captureAU = nil; outputAU = nil
+        if let abl = captureABL {
+            for b in abl { b.mData?.deallocate() }
+            abl.unsafeMutablePointer.deallocate()
+            captureABL = nil
+        }
+    }
+
+    // Realtime input thread.
+    fileprivate func captureInputArrived(flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+                                         timeStamp: UnsafePointer<AudioTimeStamp>,
+                                         bus: UInt32, frames: UInt32) {
+        guard let au = captureAU, let abl = captureABL else { return }
+        let n = min(Int(frames), Self.maxCaptureFrames)
+        for i in 0..<abl.count { abl[i].mDataByteSize = UInt32(n * 4) }
+        guard AudioUnitRender(au, flags, timeStamp, bus, UInt32(n), abl.unsafeMutablePointer) == noErr,
+              let l = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+        let r = abl.count > 1 ? abl[1].mData!.assumingMemoryBound(to: Float.self) : l
+        // Mono sum, as before (both channels carry the same signal).
+        for i in 0..<n { l[i] = (l[i] + r[i]) * 0.5 }
+        captureRing.write(left: l, right: l, count: n)
+    }
+
+    // Realtime output thread.
+    fileprivate func renderCaptureOutput(_ ioData: UnsafeMutablePointer<AudioBufferList>, frames total: Int) {
+        let list = UnsafeMutableAudioBufferListPointer(ioData)
+        let ratio = captureRate / 44100
+        var done = 0
+        while done < total {
+            let n = min(total - done, Self.maxRenderFrames)
+            scratchL.withUnsafeMutableBufferPointer { lb in
+                scratchR.withUnsafeMutableBufferPointer { rb in
+                    let l = lb.baseAddress!, r = rb.baseAddress!
+                    captureRing.read(left: l, right: r, count: n, baseRatio: ratio)
+                    var g = preampLinear
+                    vDSP_vsmul(l, 1, &g, l, 1, vDSP_Length(n))
+                    vDSP_vsmul(r, 1, &g, r, 1, vDSP_Length(n))
+                    renderChain(left: l, right: r, count: n)
+                    if list.count > 0, let out = list[0].mData?.assumingMemoryBound(to: Float.self) {
+                        (out + done).assign(from: l, count: n)
+                    }
+                    if list.count > 1, let out = list[1].mData?.assumingMemoryBound(to: Float.self) {
+                        (out + done).assign(from: r, count: n)
+                    }
+                    if done == 0, vizLock.try() {
+                        let m = min(n, vizSnapshot.count)
+                        vizSnapshot.withUnsafeMutableBufferPointer { $0.baseAddress!.assign(from: l, count: m) }
+                        vizLock.unlock()
+                    }
+                }
+            }
+            done += n
+        }
     }
 
     // MARK: - System device helpers
@@ -694,7 +719,9 @@ final class AudioEngine {
         duration    = Double(file.length) / file.processingFormat.sampleRate
         player.stop()
         schedule(file: file, from: 0)
-        if !engine.isRunning { try engine.start() }
+        // In System mode the DSP chain belongs to the capture units; the main
+        // engine stays offline until capture stops.
+        if !engine.isRunning && !isSystemCapture { try engine.start() }
     }
 
     private func schedule(file: AVAudioFile, from startFrame: AVAudioFramePosition) {
@@ -736,8 +763,8 @@ final class AudioEngine {
 // the index update); sample copies happen outside it.
 final class JitterRing {
     private static let size = 1 << 17                 // ~3 s at 44.1 kHz
-    private static let primeFrames = 4410 + 2048      // one tap chunk + ~46 ms
-    private static let maxFrames   = 4410 * 3 + 2048
+    private let primeFrames: Int
+    private let maxFrames: Int
 
     // Raw storage (not Swift arrays): both threads touch it concurrently,
     // and array copy-on-write/exclusivity semantics aren't safe for that.
@@ -748,7 +775,9 @@ final class JitterRing {
     private var priming  = true
     private let lock = NSLock()
 
-    init() {
+    init(primeFrames: Int, maxFrames: Int) {
+        self.primeFrames = primeFrames
+        self.maxFrames = maxFrames
         bufL.initialize(repeating: 0, count: Self.size)
         bufR.initialize(repeating: 0, count: Self.size)
     }
@@ -776,14 +805,14 @@ final class JitterRing {
         lock.lock()
         writeIdx = w &+ count
         let avail = writeIdx &- readIdx
-        if avail > Self.maxFrames { readIdx = writeIdx &- Self.primeFrames }
+        if avail > maxFrames { readIdx = writeIdx &- primeFrames }
         lock.unlock()
     }
 
     func read(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, count: Int) {
         lock.lock()
         let avail = writeIdx &- readIdx
-        if priming && avail >= Self.primeFrames { priming = false }
+        if priming && avail >= primeFrames { priming = false }
         let n = priming ? 0 : min(count, avail)
         let r0 = readIdx
         readIdx = r0 &+ n
@@ -796,5 +825,118 @@ final class JitterRing {
             right[i] = bufR[(r0 &+ i) & mask]
         }
         for i in n..<count { left[i] = 0; right[i] = 0 }
+    }
+}
+
+// MARK: - ResamplingRing
+//
+// System-mode ring between two independent hardware clocks: the capture
+// device (BlackHole) writes at its rate, the output device reads at 44.1 kHz.
+// The reader resamples with 4-point Hermite interpolation at
+// captureRate/44100, nudged by up to ±0.5% according to how full the ring
+// is, so the fill level is held near `target` indefinitely — clock drift
+// between the devices is absorbed smoothly instead of eventually running
+// the ring dry or overfull (either of which is an audible pop). Both sides
+// run on realtime threads with small (~512-frame) buffers, so a modest
+// cushion suffices. Hard underrun/overflow handling remains as a last resort.
+final class ResamplingRing {
+    private static let size = 1 << 17
+    private static let target = 4096.0          // ~85–93 ms cushion
+    private static let maxCorrection = 0.005
+    private static let gain = 0.002             // ratio correction per unit of fill error
+
+    private let bufL = UnsafeMutablePointer<Float>.allocate(capacity: ResamplingRing.size)
+    private let bufR = UnsafeMutablePointer<Float>.allocate(capacity: ResamplingRing.size)
+    private var writeIdx = 0
+    private var readPos: Double = 0              // reader only
+    private var fillAvg: Double = ResamplingRing.target
+    private var priming = true
+    private var resetPending = false
+    private let lock = NSLock()
+
+    init() {
+        bufL.initialize(repeating: 0, count: Self.size)
+        bufR.initialize(repeating: 0, count: Self.size)
+    }
+
+    deinit {
+        bufL.deallocate()
+        bufR.deallocate()
+    }
+
+    func reset() {
+        lock.lock()
+        writeIdx = 0
+        resetPending = true
+        lock.unlock()
+    }
+
+    func write(left: UnsafePointer<Float>, right: UnsafePointer<Float>, count: Int) {
+        lock.lock()
+        let w = writeIdx
+        lock.unlock()
+        let mask = Self.size - 1
+        for i in 0..<count {
+            bufL[(w &+ i) & mask] = left[i]
+            bufR[(w &+ i) & mask] = right[i]
+        }
+        lock.lock()
+        writeIdx = w &+ count
+        lock.unlock()
+    }
+
+    func read(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>,
+              count: Int, baseRatio: Double) {
+        lock.lock()
+        let w = Double(writeIdx)
+        if resetPending { readPos = 0; priming = true; resetPending = false }
+        lock.unlock()
+
+        var avail = w - readPos
+        if priming {
+            if avail >= Self.target {
+                priming = false
+                readPos = w - Self.target
+                fillAvg = Self.target
+                avail = Self.target
+            } else {
+                for i in 0..<count { left[i] = 0; right[i] = 0 }
+                return
+            }
+        }
+        if avail > Self.target * 4 {                 // way overfull (e.g. output stalled)
+            readPos = w - Self.target
+            avail = Self.target
+        }
+
+        // Smoothed fill level → gentle rate correction (≈1 s smoothing).
+        fillAvg += 0.02 * (avail - fillAvg)
+        let err = (fillAvg - Self.target) / Self.target
+        let ratio = baseRatio * (1 + max(-Self.maxCorrection, min(Self.maxCorrection, Self.gain * err)))
+
+        let mask = Self.size - 1
+        var pos = readPos
+        for i in 0..<count {
+            if pos + 3 >= w {                        // underrun: re-prime the cushion
+                for j in i..<count { left[j] = 0; right[j] = 0 }
+                priming = true
+                break
+            }
+            let i0 = Int(pos)
+            let t = Float(pos - Double(i0))
+            left[i]  = Self.hermite(bufL, i0, t, mask)
+            right[i] = Self.hermite(bufR, i0, t, mask)
+            pos += ratio
+        }
+        readPos = pos
+    }
+
+    @inline(__always)
+    private static func hermite(_ b: UnsafeMutablePointer<Float>, _ i: Int, _ t: Float, _ mask: Int) -> Float {
+        let y0 = b[(i &- 1) & mask], y1 = b[i & mask], y2 = b[(i &+ 1) & mask], y3 = b[(i &+ 2) & mask]
+        let c1 = 0.5 * (y2 - y0)
+        let c2 = y0 - 2.5 * y1 + 2 * y2 - 0.5 * y3
+        let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2)
+        return ((c3 * t + c2) * t + c1) * t + y1
     }
 }
