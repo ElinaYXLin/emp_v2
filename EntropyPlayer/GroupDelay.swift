@@ -15,14 +15,21 @@ import Accelerate
 // When the scale changes (macro/knob/vibrato) the audio thread crossfades
 // from the old filter's output to the new one's across one block, so moving
 // the control doesn't click.
+//
+// Randomness: the scale wanders within base × (1 ± randomness) (randomness
+// 0…0.5). A parameter-thread timer glides toward a random target with a
+// smoothstep curve over several seconds, then picks the next target, so the
+// delay drifts slowly rather than jumping; each small step is redesigned and
+// crossfaded like any other change.
 final class GroupDelay {
 
     private let lock = NSLock()
     private var sampleRate: Double = 44100
 
-    /// 16384 taps ≈ 370 ms at 44.1 kHz: covers the 250 ms max delay plus the
-    /// bulk offset and dispersion tail with margin.
-    private static let taps = 16384
+    /// 24576 taps ≈ 557 ms at 44.1 kHz: covers the 375 ms max delay (5x base
+    /// + 50% randomness at 20 Hz) plus the bulk offset and dispersion tail.
+    private static let taps = 24576
+    private static let maxScale = 7.5
     /// Small fixed bulk delay so the chirp's high-frequency onset (and the
     /// ringing from band-limiting it) isn't truncated at t = 0. ~1.5 ms.
     private static let bulkDelay = 64
@@ -37,10 +44,31 @@ final class GroupDelay {
     private var pendingGen = 0
     private var currentScale: Double = 0
 
+    // Modulation state — touched only on paramQueue.
+    private let paramQueue = DispatchQueue(label: "GroupDelay.params", qos: .userInitiated)
+    private var modTimer: DispatchSourceTimer?
+    private var baseScale: Double = 0
+    private var randomness: Double = 0
+    private var modFrom: Double = 0          // offset in -1…1
+    private var modTo: Double = 0
+    private var modElapsed: Double = 0
+    private var modDuration: Double = 4
+    private static let modTick = 1.0 / 30
+
     private var activeIR: [Float]? = nil
     private var activeGen = 0
     private var historyL = [Float](repeating: 0, count: GroupDelay.taps - 1)
     private var historyR = [Float](repeating: 0, count: GroupDelay.taps - 1)
+
+    init() {
+        let t = DispatchSource.makeTimerSource(queue: paramQueue)
+        t.schedule(deadline: .now() + Self.modTick, repeating: Self.modTick)
+        t.setEventHandler { [weak self] in self?.modStep() }
+        t.resume()
+        modTimer = t
+    }
+
+    deinit { modTimer?.cancel() }
 
     func setSampleRate(_ sr: Double) {
         lock.lock()
@@ -50,7 +78,45 @@ final class GroupDelay {
 
     /// scale: multiplier on one period of delay (0…5).
     func setScale(_ scale: Double) {
-        let s = max(0, min(5, scale))
+        paramQueue.async { [weak self] in
+            guard let self else { return }
+            self.baseScale = max(0, min(5, scale))
+            self.applyModulated()
+        }
+    }
+
+    /// randomness: max deviation as a fraction of the scale (0…0.5).
+    func setRandomness(_ r: Double) {
+        paramQueue.async { [weak self] in
+            guard let self else { return }
+            self.randomness = max(0, min(0.5, r))
+            self.applyModulated()
+        }
+    }
+
+    private func modOffset() -> Double {
+        let t = min(1, modElapsed / modDuration)
+        let eased = t * t * (3 - 2 * t)       // smoothstep: zero slope at both ends
+        return modFrom + (modTo - modFrom) * eased
+    }
+
+    private func modStep() {
+        modElapsed += Self.modTick
+        if modElapsed >= modDuration {
+            modFrom = modTo
+            modTo = Double.random(in: -1...1)
+            modElapsed = 0
+            modDuration = Double.random(in: 3...6)
+        }
+        applyModulated()
+    }
+
+    private func applyModulated() {
+        apply(scale: baseScale * (1 + randomness * modOffset()))
+    }
+
+    private func apply(scale: Double) {
+        let s = max(0, min(Self.maxScale, scale))
         // Skip redundant redesigns (macro drags fire this on every event).
         guard abs(s - currentScale) > 1e-4 else { return }
         currentScale = s

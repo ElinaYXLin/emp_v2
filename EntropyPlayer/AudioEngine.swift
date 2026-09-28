@@ -476,6 +476,11 @@ final class AudioEngine {
         groupDelay.setScale(Double(eff) * 5)
     }
 
+    /// Group delay randomness: effective 0–1 → ±0–50% drift around the scale.
+    func setGroupDelayRandomness(effective eff: Float) {
+        groupDelay.setRandomness(Double(eff) * 0.5)
+    }
+
     /// EQ: 0–12 dB, peaking bell at 150 Hz, Q 0.1 — matches the web edition exactly.
     func setEQ(gainDb: Float) {
         eqFilter.setParameters(gainDb: Double(gainDb))
