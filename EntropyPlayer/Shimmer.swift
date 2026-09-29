@@ -7,10 +7,10 @@ import Foundation
 // octave; a 60 Hz high-pass and 2.5 kHz low-pass inside the loop keep the
 // cascade from turning into rumble or fizz.
 //
-// One strength control (0…1) scales both how loud the glow is (up to −6 dB
+// One strength control (0…1) scales both how loud the glow is (up to 0 dB
 // re dry) and how long it sustains: the diffused glow recirculates at its
-// own pitch (sustain 0.40 → 0.82 per ~95 ms trip, ≈ 4 s RT60 at full) and a
-// smaller share (up to 0.12) goes back through the shifter for the next
+// own pitch (sustain 0.40 → 0.90 per ~95 ms trip) and a
+// smaller share (up to 0.08) goes back through the shifter for the next
 // octave down. Their sum stays below 1, so the loop is always stable.
 //
 // Octave-down shifter: a delay line read by two taps whose delays ramp at
@@ -19,7 +19,7 @@ import Foundation
 final class Shimmer {
 
     private static let sampleRate = 44100.0
-    private static let maxMix = 0.5
+    private static let maxMix = 1.0
     private static let window = 2048.0               // shifter window, ~46 ms
     private static let shiftSize = 1 << 13
     private static let apDelays: [[Int]] = [[556, 441, 341, 225], [579, 464, 356, 248]]
@@ -99,8 +99,8 @@ final class Shimmer {
 
         for i in 0..<count {
             strength += (target - strength) * glide
-            let sustain = Float(0.40 + 0.42 * strength)
-            let octaveFb = Float(0.12 * strength)
+            let sustain = Float(0.40 + 0.50 * strength)
+            let octaveFb = Float(0.08 * strength)
             let mix = Float(strength * Self.maxMix)
 
             let l = left[i], r = right?[i] ?? l

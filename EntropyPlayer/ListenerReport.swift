@@ -65,8 +65,8 @@ extension AppState {
         let blurAtk    = 0.05 + blur * 0.35
         let blurRel    = 0.10 + blur * 2.40
         let shimmer    = eff("shimmer")
-        let shimMixDb  = shimmer > 0 ? 20 * log10(shimmer * 0.5) : -Double.infinity
-        let shimRT     = shimmer > 0 ? 0.095 * 3 / -log10(0.40 + 0.42 * shimmer) : 0   // loop trip / dB per trip → RT60
+        let shimMixDb  = shimmer > 0 ? 20 * log10(shimmer) : -Double.infinity
+        let shimRT     = shimmer > 0 ? 0.095 * 3 / -log10(0.40 + 0.50 * shimmer) : 0   // loop trip / dB per trip → RT60
 
         let thd = THDMeter(preampDb: preampDb, eqDb: eqDb, evenDb: evenDb, oddDb: oddDb,
                            rolloff: rollSlope, compressor: dynamicsMode == .compressor)
