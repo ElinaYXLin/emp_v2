@@ -337,7 +337,8 @@ final class AudioEngine {
 
         // Color stage: subsonic cut → even saturator → odd saturator → high
         // roll-off (after both, so it also tames the harmonics they add).
-        for (buf, ch) in [(l, 0), (r, 1)] {
+        for ch in 0..<2 {
+            let buf = ch == 0 ? l : r
             subsonic.process(buf, count: n, channel: ch)
             satFilter.process(buf, count: n, channel: ch)
             oddSatFilter.process(buf, count: n, channel: ch)
@@ -493,6 +494,8 @@ final class AudioEngine {
     // Glitch diagnostics, logged once a minute when nonzero (counters are
     // bumped on realtime threads; approximate reads are fine for logging).
     private var captureRenderFailures = 0
+    private var captureOverloads = 0
+    private var captureMaxLoad = 0.0
     private var captureOversized = 0
     private var diagTicks = 0
 
@@ -664,11 +667,13 @@ final class AudioEngine {
             self.diagTicks += 1
             if self.diagTicks % (20 * 60) == 0 {
                 let u = self.captureRing.underruns, o = self.captureRing.overflows
-                if u + o + self.captureRenderFailures + self.captureOversized > 0 {
-                    NSLog("[EntropyPlayer] System-mode glitches in last minute: capture render failures=%d, oversized=%d, ring underruns=%d, overflows=%d",
-                          self.captureRenderFailures, self.captureOversized, u, o)
+                if u + o + self.captureRenderFailures + self.captureOversized + self.captureOverloads > 0 {
+                    NSLog("[EntropyPlayer] System-mode glitches in last minute: capture render failures=%d, oversized=%d, ring underruns=%d, overflows=%d, DSP overloads=%d",
+                          self.captureRenderFailures, self.captureOversized, u, o, self.captureOverloads)
                 }
+                NSLog("[EntropyPlayer] System-mode peak DSP load last minute: %.0f%% of callback budget", self.captureMaxLoad * 100)
                 self.captureRenderFailures = 0; self.captureOversized = 0
+                self.captureOverloads = 0; self.captureMaxLoad = 0
                 self.captureRing.underruns = 0; self.captureRing.overflows = 0
             }
         }
@@ -717,6 +722,15 @@ final class AudioEngine {
 
     // Realtime output thread.
     fileprivate func renderCaptureOutput(_ ioData: UnsafeMutablePointer<AudioBufferList>, frames total: Int) {
+        let started = DispatchTime.now().uptimeNanoseconds
+        defer {
+            // A callback that runs past (most of) its buffer's duration makes
+            // the device play a glitch even though no ring ran dry.
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9
+            let budget = Double(total) / 44100
+            if elapsed > budget * 0.8 { captureOverloads += 1 }
+            captureMaxLoad = max(captureMaxLoad, elapsed / budget)
+        }
         let list = UnsafeMutableAudioBufferListPointer(ioData)
         let ratio = captureRate / 44100
         var done = 0

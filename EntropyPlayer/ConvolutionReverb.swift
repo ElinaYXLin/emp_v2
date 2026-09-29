@@ -10,37 +10,32 @@ import Accelerate
 // boomy/quiet/reverberant at different macro points than the web app instead
 // of scaling the same way. This runs the literal same algorithm.
 //
-// For real-time safety the IR is capped at 2 seconds (88,200 samples at
-// 44.1kHz) rather than the web app's 10-second hard cap: direct convolution
-// scales with IR length, and 10s would need ~19 GFLOP/s sustained, too risky
-// for a realtime audio thread. Nearly all audible reverb character lives in
+// The IR is capped at 2 seconds (88,200 samples at 44.1kHz) rather than the
+// web app's 10-second hard cap; nearly all audible reverb character lives in
 // the first couple of seconds of decay regardless.
+//
+// The convolution runs as partitioned FFT convolution (PartitionedConvolver)
+// — it used to be direct convolution on the audio thread, which cost ~25%
+// of a core at long decays and allocated/copied several ~350 KB arrays per
+// callback; together those occasionally made the realtime output callback
+// miss its deadline, heard as a pop. The wet path now lags the dry path by
+// one 512-sample block (~12 ms), which acts as a short pre-delay.
 final class ConvolutionReverb {
 
     private let lock = NSLock()
     private var sampleRate: Double = 44100
 
-    // Reversed impulse responses (independent per channel, matching the web
-    // app's independent random noise per channel for stereo decorrelation).
-    // vDSP_conv computes C[n] = Σ_p A[n+p]·F[p]; using F = reversed h and
-    // A = [history(P-1)] + [current block] yields the correct causal
-    // convolution y[n] = Σ_k h[k]·x[n-k] (verified numerically against
-    // numpy.convolve before writing this).
-    private var irReversedL: [Float] = [0]
-    private var irReversedR: [Float] = [0]
-    private var irGen = 0
-    // Audio-thread-only state. History is kept at the maximum IR length at
-    // all times, so changing the decay never wipes the running tail, and a
-    // new IR is crossfaded in over one block (old IR's output → new IR's).
-    // Previously every knob movement resized/zeroed the history, cutting
-    // the tail off abruptly — a stutter for as long as the knob moved.
-    private var activeL: [Float] = [0]
-    private var activeR: [Float] = [0]
-    private var activeGen = 0
-    private var historyL: [Float] = []
-    private var historyR: [Float] = []
-
     private static let maxIRSeconds = 2.0
+    private let convolver = PartitionedConvolver(
+        maxPartitions: Int(44100 * ConvolutionReverb.maxIRSeconds) / PartitionedConvolver.block + 1,
+        identityDelay: nil)
+
+    // Dry copy for the mix (audio thread only).
+    private static let maxChunk = 4096
+    private let dryL = UnsafeMutablePointer<Float>.allocate(capacity: ConvolutionReverb.maxChunk)
+    private let dryR = UnsafeMutablePointer<Float>.allocate(capacity: ConvolutionReverb.maxChunk)
+
+    deinit { dryL.deallocate(); dryR.deallocate() }
 
     func setSampleRate(_ sr: Double) {
         lock.lock()
@@ -86,14 +81,10 @@ final class ConvolutionReverb {
         normalizeEnergy(&irL)
         normalizeEnergy(&irR)
 
-        // Only the IR (a parameter) is written here; historyL/historyR are
-        // filter state exclusively owned by the audio thread (see
-        // processChannel) — resizing it here too would race with process().
-        lock.lock()
-        irReversedL = irL.reversed()
-        irReversedR = irR.reversed()
-        irGen &+= 1
-        lock.unlock()
+        // Independent IRs per channel (the web app's independent random
+        // noise per channel, for stereo decorrelation). Crossfaded in by the
+        // convolver, so the running tail is never cut off.
+        convolver.setFilter(convolver.makeFilter([irL, irR]))
     }
 
     private func normalizeEnergy(_ ir: inout [Float]) {
@@ -108,61 +99,16 @@ final class ConvolutionReverb {
     /// are the same constants the web app always sums regardless of the
     /// reverb knob position — only decay length (via setDecay) changes.
     func process(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>?, count: Int) {
-        lock.lock()
-        let irL = irReversedL
-        let irR = irReversedR
-        let gen = irGen
-        let maxLen = max(1, Int(sampleRate * Self.maxIRSeconds))
-        lock.unlock()
-
-        let changed = gen != activeGen
-        processChannel(left, count: count, ir: irL, oldIR: changed ? activeL : nil,
-                       maxLen: maxLen, history: &historyL)
-        if let right {
-            processChannel(right, count: count, ir: irR, oldIR: changed ? activeR : nil,
-                           maxLen: maxLen, history: &historyR)
-        }
-        activeL = irL; activeR = irR; activeGen = gen
-    }
-
-    private func processChannel(_ buffer: UnsafeMutablePointer<Float>, count: Int,
-                                 ir: [Float], oldIR: [Float]?, maxLen: Int,
-                                 history: inout [Float]) {
-        if history.count != maxLen - 1 {
-            history = [Float](repeating: 0, count: maxLen - 1)
-        }
-
-        var a = history
-        a.append(contentsOf: UnsafeBufferPointer(start: buffer, count: count))
-
-        // Convolve against the most recent (p-1) history samples + block.
-        func convolve(_ h: [Float]) -> [Float] {
-            let p = min(h.count, maxLen)
-            var out = [Float](repeating: 0, count: count)
-            guard p > 0 else { return out }
-            h.withUnsafeBufferPointer { hPtr in
-                a.withUnsafeBufferPointer { aPtr in
-                    vDSP_conv(aPtr.baseAddress! + (maxLen - p), 1,
-                              hPtr.baseAddress! + (h.count - p), 1, &out, 1,
-                              vDSP_Length(count), vDSP_Length(p))
-                }
-            }
-            return out
-        }
-
-        var wet = convolve(ir)
-        if let oldIR {
-            let prev = convolve(oldIR)
-            for i in 0..<count {
-                let t = Float(i + 1) / Float(count)
-                wet[i] = prev[i] + (wet[i] - prev[i]) * t
-            }
-        }
-
-        history = Array(a.suffix(maxLen - 1))
-
-        for i in 0..<count {
-            buffer[i] = buffer[i] * 0.6 + wet[i] * 0.8
+        var done = 0
+        while done < count {
+            let n = min(count - done, Self.maxChunk)
+            let l = left + done, r = right.map { $0 + done }
+            dryL.assign(from: l, count: n)
+            if let r { dryR.assign(from: r, count: n) }
+            convolver.process(left: l, right: r, count: n)     // → wet
+            for i in 0..<n { l[i] = dryL[i] * 0.6 + l[i] * 0.8 }
+            if let r { for i in 0..<n { r[i] = dryR[i] * 0.6 + r[i] * 0.8 } }
+            done += n
         }
     }
 }
