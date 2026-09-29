@@ -38,7 +38,7 @@ final class AudioEngine {
     // -3000), so audio leaves the graph through a tap on preampMixer and
     // re-enters through dspSourceNode, whose render callback runs the whole
     // chain inline:
-    //   group delay → reverb → EQ → +7 dB → 25 Hz high-pass → even sat → odd sat → high roll-off
+    //   group delay → spectral blur → grain echo → reverb → shimmer → EQ → +7 dB → 25 Hz high-pass → even sat → odd sat → high roll-off
     //   → limiter/compressor → post-gain → output ceiling
     //
     // This used to be four chained tap→ring→source-node bridges, one per
@@ -69,6 +69,13 @@ final class AudioEngine {
     // Frequency-dependent group delay (see GroupDelay.swift), just ahead of
     // the reverb.
     private let groupDelay       = GroupDelay()
+    // Granular memory haze (see GrainEcho.swift), between group delay and
+    // the reverb so its grains blur into the reverb tail.
+    private let grainEcho        = GrainEcho()
+    // Spectral haze: per-frequency level slew (see SpectralBlur.swift).
+    private let spectralBlur     = SpectralBlur()
+    // Temporal haze: octave-down feedback glow after the reverb (see Shimmer.swift).
+    private let shimmer          = Shimmer()
 
     // Custom saturators (see CustomSaturator.swift): replace Apple's
     // AVAudioUnitDistortion, whose presets are built from ring-modulation,
@@ -326,8 +333,12 @@ final class AudioEngine {
 
     /// The full DSP chain, in place, on the render thread.
     private func renderChain(left l: UnsafeMutablePointer<Float>, right r: UnsafeMutablePointer<Float>, count n: Int) {
+        // Spectral haze, then temporal haze.
         groupDelay.process(left: l, right: r, count: n)
+        spectralBlur.process(left: l, right: r, count: n)
+        grainEcho.process(left: l, right: r, count: n)
         reverbFilter.process(left: l, right: r, count: n)
+        shimmer.process(left: l, right: r, count: n)
 
         eqFilter.process(l, count: n, channel: 0)
         eqFilter.process(r, count: n, channel: 1)
@@ -412,6 +423,22 @@ final class AudioEngine {
     /// Group delay randomness: effective 0–1 → ±0–50% drift around the scale.
     func setGroupDelayRandomness(effective eff: Float) {
         groupDelay.setRandomness(Double(eff) * 0.5)
+    }
+
+    /// Grain echo: effective 0–1 scales the haze level (up to 0 dB re dry),
+    /// its memory window (up to 200 ms) and grain detune (±4→±35 cents) together.
+    func setGrainEcho(effective eff: Float) {
+        grainEcho.setStrength(Double(eff))
+    }
+
+    /// Spectral blur: effective 0–1 scales bloom/linger time and depth.
+    func setSpectralBlur(effective eff: Float) {
+        spectralBlur.setStrength(Double(eff))
+    }
+
+    /// Downward shimmer: effective 0–1 scales glow level and sustain.
+    func setShimmer(effective eff: Float) {
+        shimmer.setStrength(Double(eff))
     }
 
     /// EQ: 0–12 dB, peaking bell at 150 Hz, Q 0.1 — matches the web edition exactly.

@@ -22,6 +22,9 @@
 		AA2000000000000000000015 /* GroupDelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000015 /* GroupDelay.swift */; };
 		AA2000000000000000000016 /* PartitionedConvolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000016 /* PartitionedConvolver.swift */; };
 		AA2000000000000000000017 /* ListenerReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000017 /* ListenerReport.swift */; };
+		AA2000000000000000000018 /* GrainEcho.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000018 /* GrainEcho.swift */; };
+		AA2000000000000000000020 /* Shimmer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000020 /* Shimmer.swift */; };
+		AA2000000000000000000019 /* SpectralBlur.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000019 /* SpectralBlur.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -43,6 +46,9 @@
 		AA1000000000000000000015 /* GroupDelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupDelay.swift; sourceTree = "<group>"; };
 		AA1000000000000000000016 /* PartitionedConvolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PartitionedConvolver.swift; sourceTree = "<group>"; };
 		AA1000000000000000000017 /* ListenerReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListenerReport.swift; sourceTree = "<group>"; };
+		AA1000000000000000000018 /* GrainEcho.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GrainEcho.swift; sourceTree = "<group>"; };
+		AA1000000000000000000020 /* Shimmer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shimmer.swift; sourceTree = "<group>"; };
+		AA1000000000000000000019 /* SpectralBlur.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpectralBlur.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -82,6 +88,9 @@
 				AA1000000000000000000015 /* GroupDelay.swift */,
 				AA1000000000000000000016 /* PartitionedConvolver.swift */,
 				AA1000000000000000000017 /* ListenerReport.swift */,
+				AA1000000000000000000018 /* GrainEcho.swift */,
+				AA1000000000000000000020 /* Shimmer.swift */,
+				AA1000000000000000000019 /* SpectralBlur.swift */,
 				AA1000000000000000000009 /* Info.plist */,
 				AA1000000000000000000010 /* EntropyPlayer.entitlements */,
 			);
@@ -179,6 +188,9 @@
 				AA2000000000000000000015 /* GroupDelay.swift in Sources */,
 				AA2000000000000000000016 /* PartitionedConvolver.swift in Sources */,
 				AA2000000000000000000017 /* ListenerReport.swift in Sources */,
+				AA2000000000000000000018 /* GrainEcho.swift in Sources */,
+				AA2000000000000000000020 /* Shimmer.swift in Sources */,
+				AA2000000000000000000019 /* SpectralBlur.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -280,18 +280,26 @@ struct ContentView: View {
                     knobRow(key: "rolloff", label: "High Roll", sub: "dB/oct >1k",
                             display: { String(format: "%.1fdB/oct", $0/100*6) })
                 }
-                knobGroup("Hazy") {
-                    knobRow(key: "reverb", label: "Reverb",    sub: "Decay time",
-                            display: { String(format: "%.1fs", pow($0/100, 2) * 20) })
+                knobGroup("Spectral Haze") {
                     knobRow(key: "gd",     label: "Grp Delay", sub: "Periods",
                             display: { String(format: "%.1fx", $0/100*20) })
                     knobRow(key: "gdrand", label: "GD Random", sub: "Drift",
                             display: { String(format: "±%.0f%%", $0/100*50) })
+                    knobRow(key: "blur",   label: "Spec Blur", sub: "Linger",
+                            display: { String(format: "%.1fs", 0.1 + $0/100*2.4) })
+                }
+                knobGroup("Temporal Haze") {
+                    knobRow(key: "reverb",  label: "Reverb",     sub: "Decay time",
+                            display: { String(format: "%.1fs", pow($0/100, 2) * 20) })
+                    knobRow(key: "shimmer", label: "Shimmer",    sub: "Octave down",
+                            display: { "\(Int($0))%" })
+                    knobRow(key: "grain",   label: "Grain Echo", sub: "Memory",
+                            display: { String(format: "%.0fms", $0/100*200) })
                 }
             }
             .padding(14)
         }
-        .frame(width: 500)
+        .frame(width: 740)
     }
 
     func knobGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {

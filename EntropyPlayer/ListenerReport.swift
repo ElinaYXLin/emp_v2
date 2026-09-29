@@ -56,6 +56,17 @@ extension AppState {
         let decaySec  = pow(eff("reverb"), 1.5) * 60
         let gdScale   = eff("gd") * 20
         let gdRand    = eff("gdrand") * 50
+        let grain     = eff("grain")
+        let grainMemMs = grain * 200
+        let grainMixDb = grain > 0 ? 20 * log10(grain) : -Double.infinity
+        let grainLenMs = 30 + grainMemMs * 0.25
+        let grainCents = 4 + 31 * grain
+        let blur       = eff("blur")
+        let blurAtk    = 0.05 + blur * 0.35
+        let blurRel    = 0.10 + blur * 2.40
+        let shimmer    = eff("shimmer")
+        let shimMixDb  = shimmer > 0 ? 20 * log10(shimmer * 0.5) : -Double.infinity
+        let shimRT     = shimmer > 0 ? 0.095 * 3 / -log10(0.40 + 0.42 * shimmer) : 0   // loop trip / dB per trip → RT60
 
         let thd = THDMeter(preampDb: preampDb, eqDb: eqDb, evenDb: evenDb, oddDb: oddDb,
                            rolloff: rollSlope, compressor: dynamicsMode == .compressor)
@@ -77,14 +88,25 @@ extension AppState {
                 .init(label: "High roll-off",  value: String(format: "%.1f dB/oct above 1 kHz (%.1f dB @ 10 kHz)", rollSlope, -roll10k)),
                 .init(label: "Subsonic cut",   value: "12 dB/oct below 25 Hz"),
             ]),
-            .init(title: "HAZY", rows: [
+            .init(title: "SPECTRAL HAZE", rows: [
+                .init(label: "Group delay",   value: String(format: "%.1f periods → %.0f ms @ 50 Hz, %.0f ms @ 100 Hz, %.1f ms @ 1 kHz", gdScale, gd50ms, gd100ms, gd1kms)),
+                .init(label: "Spectral smear", value: gdScale > 0 ? "±60% delay scatter per 1/12 octave" : "off"),
+                .init(label: "Delay drift",   value: String(format: "±%.0f%%, 3–6 s glides", gdRand)),
+                .init(label: "Spectral blur", value: blur > 0.001
+                      ? String(format: "%.0f%% depth, %.2f s bloom / %.1f s linger per bin", blur * 100, blurAtk, blurRel)
+                      : "off"),
+            ]),
+            .init(title: "TEMPORAL HAZE", rows: [
                 .init(label: "Reverb decay",  value: decaySec > 2
                       ? String(format: "%.1f s RT (tail capped at 2 s)", decaySec)
                       : String(format: "%.2f s RT", decaySec)),
                 .init(label: "Reverb color",  value: "wet 0.8 / dry 0.6, tail darkens 7k→1.2k Hz"),
-                .init(label: "Group delay",   value: String(format: "%.1f periods → %.0f ms @ 50 Hz, %.0f ms @ 100 Hz, %.1f ms @ 1 kHz", gdScale, gd50ms, gd100ms, gd1kms)),
-                .init(label: "Spectral smear", value: gdScale > 0 ? "±60% delay scatter per 1/12 octave" : "off"),
-                .init(label: "Delay drift",   value: String(format: "±%.0f%%, 3–6 s glides", gdRand)),
+                .init(label: "Shimmer",       value: shimmer > 0.001
+                      ? String(format: "−1 octave glow, %.1f dB re dry, ~%.1f s sustain", shimMixDb, shimRT)
+                      : "off"),
+                .init(label: "Grain echo",    value: grain > 0.001
+                      ? String(format: "%.0f ms memory, %.0f ms grains ±%.0f¢, %.1f dB re dry", grainMemMs, grainLenMs, grainCents, grainMixDb)
+                      : "off"),
             ]),
             .init(title: "GAIN STAGING", rows: [
                 .init(label: "Pre-amp",   value: String(format: "%+.1f dB", preampDb)),
@@ -128,6 +150,25 @@ extension AppState {
         like.append(evenOdd >= 0
             ? String(format: "Harmonics: tube-flavored (2nd beats 3rd by %.0f dB)", evenOdd)
             : String(format: "Harmonics: transistor-flavored (3rd beats 2nd by %.0f dB)", -evenOdd))
+        switch grainMemMs {
+        case ..<1:   break
+        case ..<40:  like.append("Memory: a faint déjà vu you can't quite place")
+        case ..<100: like.append("Memory: a chorus hummed back by a friend in the next room")
+        case ..<160: like.append("Memory: last summer's song drifting out of a parked car")
+        default:     like.append("Memory: a dream you're half-remembering over breakfast")
+        }
+        switch blur {
+        case ..<0.05: break
+        case ..<0.3:  like.append("Focus: a photo with a little Vaseline on the lens")
+        case ..<0.6:  like.append("Focus: a song remembered in the shower, mostly right")
+        default:      like.append("Focus: watercolor left out in the rain")
+        }
+        switch shimmer {
+        case ..<0.05: break
+        case ..<0.4:  like.append("Undertow: a cello quietly agreeing from the basement")
+        case ..<0.7:  like.append("Undertow: the building itself humming along")
+        default:      like.append("Undertow: whale song under the floorboards")
+        }
         if eqDb >= 6 { like.append("Low mids: a blanket fort, fully fortified") }
 
         // Coziness: darkness + space + softness + warmth, capped 0–100.
@@ -136,7 +177,8 @@ extension AppState {
         let softPts: Double  = min(gd100ms, 200) / 200 * 20
         let bodyPts: Double  = min(eqDb, 12) / 12 * 15
         let warmPts: Double  = evenOdd > 0 ? min(evenOdd, 20) / 20 * 15 : 0
-        let cozy = Int(max(0, min(100, darkPts + spacePts + softPts + bodyPts + warmPts)))
+        let hazePts: Double  = grain * 6 + blur * 7 + shimmer * 7
+        let cozy = Int(max(0, min(100, darkPts + spacePts + softPts + bodyPts + warmPts + hazePts)))
 
         let traits: [(Double, String, String)] = [
             (min(roll10k, 24) / 24, "The Velvet Fog Dweller", "prefers their treble wrapped in a wool scarf"),
@@ -144,6 +186,9 @@ extension AppState {
             (min(gd100ms, 300) / 300, "The Deep-Sea Listener", "lets the bass arrive fashionably late"),
             (min(evenDb + oddDb, 16) / 16, "The Warm Static Collector", "likes a little fuzz on the edges"),
             (min(eqDb, 12) / 12, "The Blanket Fort Architect", "builds walls out of low-mids"),
+            (grain, "The Memory Collector", "hears every song as if it already happened once"),
+            (blur, "The Soft-Focus Romantic", "lets every note melt before it lands"),
+            (shimmer, "The Basement Choir Director", "keeps an octave-down choir on standby"),
         ]
         let top = traits.max { $0.0 < $1.0 }!
         let archetype = top.0 < 0.1 ? "The Purist" : top.1
@@ -258,7 +303,7 @@ struct ListenerReportCard: View {
     private var dim: Color { hue(s: 0.15, b: 0.62) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 14) {
             // Header + score
             HStack(alignment: .firstTextBaseline) {
                 Text("ENTROPY PLAYER · LISTENER REPORT")
@@ -333,7 +378,7 @@ struct ListenerReportCard: View {
                 .font(.system(size: 12, design: .monospaced)).foregroundColor(dim)
         }
         .padding(48)
-        .frame(width: 1080, height: 1350, alignment: .topLeading)
+        .frame(width: 1080, height: 1560, alignment: .topLeading)
         .background(
             LinearGradient(colors: [hue(s: 0.55, b: 0.16), hue(0.06, s: 0.45, b: 0.08), Color.black],
                            startPoint: .topLeading, endPoint: .bottomTrailing))
@@ -402,7 +447,7 @@ enum ListenerReportRenderer {
             return NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
         }
         let host = NSHostingView(rootView: card)
-        host.frame = NSRect(x: 0, y: 0, width: 1080, height: 1350)
+        host.frame = NSRect(x: 0, y: 0, width: 1080, height: 1560)
         host.layoutSubtreeIfNeeded()
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return nil }
         host.cacheDisplay(in: host.bounds, to: rep)

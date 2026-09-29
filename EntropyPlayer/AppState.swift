@@ -10,9 +10,9 @@ struct RangeValue: Codable { var min: Double = 0; var max: Double = 100 }
 struct AppSettings: Codable {
     var waveColor:    String = "#35d6d0"
     var macro:        Double = 0
-    var sensitivity:  [String: Double] = ["reverb": 15, "gd": 25, "gdrand": 36, "eq": 24, "sat": 71, "oddsat": 22, "rolloff": 43]
+    var sensitivity:  [String: Double] = ["reverb": 15, "gd": 25, "gdrand": 36, "grain": 50, "blur": 50, "shimmer": 50, "eq": 24, "sat": 71, "oddsat": 22, "rolloff": 43]
     var ranges:       [String: RangeValue] = [
-        "reverb": .init(), "gd": .init(), "gdrand": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init()
+        "reverb": .init(), "gd": .init(), "gdrand": .init(), "grain": .init(), "blur": .init(), "shimmer": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init()
     ]
     var order:        String = "alpha"
     var dynamics:     String = "limiter"
@@ -27,8 +27,8 @@ final class AppState: ObservableObject {
     @Published var macro: Double = 0              // 0–100
     @Published var preampDb: Double = 0           // -12…0
     @Published var postGainDb: Double = 0         // -24…24, final output volume trim/boost
-    @Published var sensitivity: [String: Double] = ["reverb": 15, "gd": 25, "gdrand": 36, "eq": 24, "sat": 71, "oddsat": 22, "rolloff": 43]
-    @Published var ranges: [String: RangeValue]  = ["reverb": .init(), "gd": .init(), "gdrand": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init()]
+    @Published var sensitivity: [String: Double] = ["reverb": 15, "gd": 25, "gdrand": 36, "grain": 50, "blur": 50, "shimmer": 50, "eq": 24, "sat": 71, "oddsat": 22, "rolloff": 43]
+    @Published var ranges: [String: RangeValue]  = ["reverb": .init(), "gd": .init(), "gdrand": .init(), "grain": .init(), "blur": .init(), "shimmer": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init()]
     @Published var waveColor: Color = Color(hex: "#35d6d0")
     @Published var dynamicsMode: AudioEngine.DynamicsMode = .limiter
     @Published var macroMode: MacroMode = .manual
@@ -159,6 +159,9 @@ final class AppState: ObservableObject {
         audio.setReverb(effective: effective("reverb"), skipUpdate: skipReverb)
         audio.setGroupDelay(effective: effective("gd"))
         audio.setGroupDelayRandomness(effective: effective("gdrand"))
+        audio.setGrainEcho(effective: effective("grain"))
+        audio.setSpectralBlur(effective: effective("blur"))
+        audio.setShimmer(effective: effective("shimmer"))
         audio.setEQ(gainDb: effective("eq") * 12)
         audio.setSaturator(driveDb: effective("sat") * 8)
         audio.setOddSaturator(driveDb: effective("oddsat") * 8)
