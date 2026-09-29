@@ -138,8 +138,12 @@ final class AudioEngine {
         outputCeiling.configure(thresholdDb: 0, kneeDb: 0, ratio: 20,
                                  attackSec: 0.0005, releaseSec: 0.05, trimDb: 0)
 
-        buildGraph()
+        // Device buffer size first, then start the engine: resizing it after
+        // start left the output unit with a stale 470-frame slice limit while
+        // the device asked for 512 (kAudioUnitErr_TooManyFramesToProcess).
         setLowLatency()
+        buildGraph()
+        startDiagnostics()
         applyLimiterMode()
         setReverb(effective: 0)  // establish the baseline IR immediately, matching
                                   // the web edition's applyReverb(0) call at page load.
@@ -294,7 +298,30 @@ final class AudioEngine {
             self?.onSamples?((0..<n).map { ch[0][$0] })
         }
 
+        allowLargeOutputSlices()
         try? engine.start()
+    }
+
+    /// Let the engine's hardware output unit render any slice size the
+    /// device may request (must be set while the unit is uninitialized).
+    private func allowLargeOutputSlices() {
+        guard let au = engine.outputNode.audioUnit else { return }
+        var maxFrames = UInt32(Self.maxRenderFrames)
+        AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFrames, 4)
+    }
+
+    // Once-a-minute glitch summary for normal playback (System mode logs its
+    // own). Silent when nothing went wrong.
+    private var diagTimer: Timer?
+    private func startDiagnostics() {
+        diagTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard let self, !self.isSystemCapture else { return }
+            let u = self.dspRing.underruns, t = self.dspRing.trims
+            if u + t > 0 {
+                NSLog("[EntropyPlayer] Playback glitches in last minute: ring underruns=%d, trims=%d", u, t)
+            }
+            self.dspRing.underruns = 0; self.dspRing.trims = 0
+        }
     }
 
     /// The full DSP chain, in place, on the render thread.
@@ -804,6 +831,7 @@ final class JitterRing {
     private var readIdx  = 0
     private var priming  = true
     private let lock = NSLock()
+    var underruns = 0, trims = 0                      // diagnostics
 
     init(primeFrames: Int, maxFrames: Int) {
         self.primeFrames = primeFrames
@@ -835,7 +863,7 @@ final class JitterRing {
         lock.lock()
         writeIdx = w &+ count
         let avail = writeIdx &- readIdx
-        if avail > maxFrames { readIdx = writeIdx &- primeFrames }
+        if avail > maxFrames { readIdx = writeIdx &- primeFrames; trims += 1 }
         lock.unlock()
     }
 
@@ -846,7 +874,10 @@ final class JitterRing {
         let n = priming ? 0 : min(count, avail)
         let r0 = readIdx
         readIdx = r0 &+ n
-        if n < count { priming = true }                // underrun → rebuild cushion
+        if n < count {
+            if !priming { underruns += 1 }
+            priming = true                             // underrun → rebuild cushion
+        }                // underrun → rebuild cushion
         lock.unlock()
 
         let mask = Self.size - 1
