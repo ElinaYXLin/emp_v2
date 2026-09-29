@@ -45,8 +45,11 @@ struct ContentView: View {
                 searchField
                 Divider().frame(height: 22)
                 orderToggle
-                Button("Save Settings") { app.saveSettings() }.buttonStyle(EntBtn())
-                Button("Load Settings") { app.loadSettings() }.buttonStyle(EntBtn())
+                Group {
+                    Button("Save Settings") { app.saveSettings() }.buttonStyle(EntBtn())
+                    Button("Load Settings") { app.loadSettings() }.buttonStyle(EntBtn())
+                    Button("Listener Report") { app.exportListenerReport() }.buttonStyle(EntBtn())
+                }
                 Spacer()
                 Text("COLOR").font(.system(size: 9, design: .monospaced)).foregroundColor(Color(hex:"#8f8778"))
                 ColorPicker("", selection: $app.waveColor).labelsHidden().frame(width: 30)

@@ -60,6 +60,8 @@ final class AppState: ObservableObject {
     private var vibratoTarget: Double = 0
     private var vibratoStartMacro: Double = 0
     private var vibratoStartTime: Date = .now
+    /// Center of the vibrato's ±10 motion range (see Listener Report).
+    var vibratoCenter: Double { vibratoOrigin }
 
     // MARK: Time timer
     private var timeTimer: Timer?
