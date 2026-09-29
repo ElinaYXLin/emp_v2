@@ -463,6 +463,12 @@ final class AudioEngine {
     private static let maxCaptureFrames = 8192
     private var preampLinear: Float = 1
 
+    // Glitch diagnostics, logged once a minute when nonzero (counters are
+    // bumped on realtime threads; approximate reads are fine for logging).
+    private var captureRenderFailures = 0
+    private var captureOversized = 0
+    private var diagTicks = 0
+
     // Waveform display in System mode (no tapMixer tap running): the output
     // callback drops a snapshot here, a main-thread timer forwards it.
     private let vizLock = NSLock()
@@ -583,6 +589,15 @@ final class AudioEngine {
         }
         captureABL = abl
 
+        // The unit's default slice limit is derived from the device's buffer
+        // size (it came out as 470 frames), but BlackHole delivers 512-frame
+        // cycles — AudioUnitRender then fails with TooManyFramesToProcess
+        // (-10874) and that whole block is lost: a pop. Allow any size we
+        // have buffers for.
+        var maxIn = UInt32(Self.maxCaptureFrames)
+        try check(AudioUnitSetProperty(inAU, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
+                                       &maxIn, 4), "set input max frames")
+
         var inCB = AURenderCallbackStruct(inputProc: _captureInput,
                                           inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
         try check(AudioUnitSetProperty(inAU, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
@@ -602,7 +617,8 @@ final class AudioEngine {
         try check(AudioUnitSetProperty(outAU, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0,
                                        &clientOut, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "set output format")
         var maxFrames = UInt32(Self.maxRenderFrames)
-        AudioUnitSetProperty(outAU, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFrames, 4)
+        try check(AudioUnitSetProperty(outAU, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
+                                       &maxFrames, 4), "set output max frames")
         var outCB = AURenderCallbackStruct(inputProc: _captureOutput,
                                            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
         try check(AudioUnitSetProperty(outAU, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0,
@@ -618,6 +634,16 @@ final class AudioEngine {
             guard let self else { return }
             self.vizLock.lock(); let snap = self.vizSnapshot; self.vizLock.unlock()
             self.onSamples?(snap)
+            self.diagTicks += 1
+            if self.diagTicks % (20 * 60) == 0 {
+                let u = self.captureRing.underruns, o = self.captureRing.overflows
+                if u + o + self.captureRenderFailures + self.captureOversized > 0 {
+                    NSLog("[EntropyPlayer] System-mode glitches in last minute: capture render failures=%d, oversized=%d, ring underruns=%d, overflows=%d",
+                          self.captureRenderFailures, self.captureOversized, u, o)
+                }
+                self.captureRenderFailures = 0; self.captureOversized = 0
+                self.captureRing.underruns = 0; self.captureRing.overflows = 0
+            }
         }
     }
 
@@ -650,8 +676,12 @@ final class AudioEngine {
         guard let au = captureAU, let abl = captureABL else { return }
         let n = min(Int(frames), Self.maxCaptureFrames)
         for i in 0..<abl.count { abl[i].mDataByteSize = UInt32(n * 4) }
-        guard AudioUnitRender(au, flags, timeStamp, bus, UInt32(n), abl.unsafeMutablePointer) == noErr,
-              let l = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+        if Int(frames) > Self.maxCaptureFrames { captureOversized += 1 }
+        guard AudioUnitRender(au, flags, timeStamp, bus, UInt32(n), abl.unsafeMutablePointer) == noErr else {
+            captureRenderFailures += 1
+            return
+        }
+        guard let l = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return }
         let r = abl.count > 1 ? abl[1].mData!.assumingMemoryBound(to: Float.self) : l
         // Mono sum, as before (both channels carry the same signal).
         for i in 0..<n { l[i] = (l[i] + r[i]) * 0.5 }
@@ -853,6 +883,7 @@ final class ResamplingRing {
     private var priming = true
     private var resetPending = false
     private let lock = NSLock()
+    var underruns = 0, overflows = 0             // diagnostics
 
     init() {
         bufL.initialize(repeating: 0, count: Self.size)
@@ -905,6 +936,7 @@ final class ResamplingRing {
             }
         }
         if avail > Self.target * 4 {                 // way overfull (e.g. output stalled)
+            overflows += 1
             readPos = w - Self.target
             avail = Self.target
         }
@@ -919,6 +951,7 @@ final class ResamplingRing {
         for i in 0..<count {
             if pos + 3 >= w {                        // underrun: re-prime the cushion
                 for j in i..<count { left[j] = 0; right[j] = 0 }
+                underruns += 1
                 priming = true
                 break
             }
