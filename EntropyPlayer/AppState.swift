@@ -10,10 +10,11 @@ struct RangeValue: Codable { var min: Double = 0; var max: Double = 100 }
 struct AppSettings: Codable {
     var waveColor:    String = "#35d6d0"
     var macro:        Double = 0
-    var sensitivity:  [String: Double] = ["reverb": 15, "gd": 25, "gdrand": 36, "grain": 50, "blur": 50, "shimmer": 50, "eq": 24, "sat": 71, "oddsat": 22, "rolloff": 43]
+    var sensitivity:  [String: Double] = GlobalPreset.initPreset.sensitivity
     var ranges:       [String: RangeValue] = [
-        "reverb": .init(), "gd": .init(), "gdrand": .init(), "grain": .init(), "blur": .init(), "shimmer": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init()
+        "reverb": .init(), "gd": .init(), "gdrand": .init(), "grain": .init(), "blur": .init(), "shimmer": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init(), "hyst": .init(), "sag": .init()
     ]
+    var recipe:       String? = nil      // optional: older files predate recipes
     var order:        String = "alpha"
     var dynamics:     String = "limiter"
 }
@@ -27,9 +28,11 @@ final class AppState: ObservableObject {
     @Published var macro: Double = 0              // 0–100
     @Published var preampDb: Double = 0           // -12…0
     @Published var postGainDb: Double = 0         // -24…24, final output volume trim/boost
-    @Published var sensitivity: [String: Double] = ["reverb": 15, "gd": 25, "gdrand": 36, "grain": 50, "blur": 50, "shimmer": 50, "eq": 24, "sat": 71, "oddsat": 22, "rolloff": 43]
-    @Published var ranges: [String: RangeValue]  = ["reverb": .init(), "gd": .init(), "gdrand": .init(), "grain": .init(), "blur": .init(), "shimmer": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init()]
+    @Published var sensitivity: [String: Double] = GlobalPreset.initPreset.sensitivity
+    @Published var ranges: [String: RangeValue]  = ["reverb": .init(), "gd": .init(), "gdrand": .init(), "grain": .init(), "blur": .init(), "shimmer": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init(), "hyst": .init(), "sag": .init()]
     @Published var waveColor: Color = Color(hex: "#35d6d0")
+    @Published var satRecipe: String = SaturatorRecipe.classic.name
+    @Published var selectedPreset: String = GlobalPreset.initName
     @Published var dynamicsMode: AudioEngine.DynamicsMode = .limiter
     @Published var macroMode: MacroMode = .manual
     @Published var vibratoSpeed: VibratoSpeed = .slow
@@ -148,7 +151,10 @@ final class AppState: ObservableObject {
     // MARK: - Effective level computation
     // effective = lerp(range.min, range.max, macro) * sensitivity → 0…1
     func effective(_ key: String) -> Float {
-        let s = Float(sensitivity[key] ?? 50) / 100
+        var s = Float(sensitivity[key] ?? 50) / 100
+        // Reverb is very strong, so its knob is quadratic: 40% acts like the
+        // old linear 16%, 60% like 36%.
+        if key == "reverb" { s *= s }
         let r = ranges[key] ?? RangeValue()
         let mapped = Float(r.min + (r.max - r.min) * (macro / 100)) / 100
         return mapped * s
@@ -162,9 +168,12 @@ final class AppState: ObservableObject {
         audio.setGrainEcho(effective: effective("grain"))
         audio.setSpectralBlur(effective: effective("blur"))
         audio.setShimmer(effective: effective("shimmer"))
+        audio.setTapeHysteresis(effective: effective("hyst"))
+        audio.setTapeSag(effective: effective("sag"))
+        audio.setSaturatorRecipe(SaturatorRecipe.named(satRecipe))
         audio.setEQ(gainDb: effective("eq") * 12)
-        audio.setSaturator(driveDb: effective("sat") * 8)
-        audio.setOddSaturator(driveDb: effective("oddsat") * 8)
+        audio.setSaturator(driveDb: effective("sat") * 16)
+        audio.setOddSaturator(driveDb: effective("oddsat") * 16)
         audio.setHighRolloff(dbPerOctave: effective("rolloff") * 6)
     }
 
@@ -296,6 +305,23 @@ final class AppState: ObservableObject {
         if t >= 1 { pickVibratoTarget(from: newMacro) }
     }
 
+    // MARK: - Presets
+
+    func applyPreset(named name: String) {
+        guard let p = GlobalPreset.named(name) else { return }
+        selectedPreset = p.name
+        sensitivity = p.sensitivity
+        ranges = AppSettings().ranges
+        satRecipe = p.recipe
+        if macroMode != .manual { setMacroMode(.manual) }
+        setMacro(p.macro)
+    }
+
+    func setRecipe(_ name: String) {
+        satRecipe = name
+        applyAllDSP()
+    }
+
     // MARK: - Settings save / load
     func saveSettings() {
         var s = AppSettings()
@@ -304,6 +330,7 @@ final class AppState: ObservableObject {
         s.sensitivity = sensitivity
         s.ranges      = ranges
         s.dynamics    = dynamicsMode == .limiter ? "limiter" : "compressor"
+        s.recipe      = satRecipe
 
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.json]
@@ -321,8 +348,10 @@ final class AppState: ObservableObject {
               let s    = try? JSONDecoder().decode(AppSettings.self, from: data) else { return }
 
         waveColor   = Color(hex: s.waveColor)
-        sensitivity = s.sensitivity
-        ranges      = s.ranges
+        // Merge onto INIT so knobs added after the file was saved get their defaults.
+        sensitivity = GlobalPreset.initPreset.sensitivity.merging(s.sensitivity) { _, new in new }
+        ranges      = AppSettings().ranges.merging(s.ranges) { _, new in new }
+        satRecipe   = s.recipe ?? SaturatorRecipe.classic.name
         dynamicsMode = s.dynamics == "compressor" ? .compressor : .limiter
         audio.setDynamics(mode: dynamicsMode)
         setMacro(s.macro)

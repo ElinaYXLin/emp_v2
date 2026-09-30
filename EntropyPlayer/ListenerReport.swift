@@ -15,6 +15,7 @@ struct ListenerReport {
 
     let macro: Double
     let macroNote: String
+    let presetName: String
     let thd100: Double          // %
     let thd1k: Double           // %
     let evenOddDb: Double       // H2 − H3 at 100 Hz, dB (positive = even-dominant)
@@ -40,7 +41,8 @@ extension AppState {
     }
 
     func effective(_ key: String, atMacro m: Double) -> Double {
-        let s = (sensitivity[key] ?? 50) / 100
+        var s = (sensitivity[key] ?? 50) / 100
+        if key == "reverb" { s *= s }             // quadratic knob, as in AppState.effective
         let r = ranges[key] ?? RangeValue()
         return (r.min + (r.max - r.min) * (m / 100)) / 100 * s
     }
@@ -50,8 +52,8 @@ extension AppState {
         let eff = { self.effective($0, atMacro: m) }
 
         let eqDb      = eff("eq") * 12
-        let evenDb    = eff("sat") * 8
-        let oddDb     = eff("oddsat") * 8
+        let evenDb    = eff("sat") * 16
+        let oddDb     = eff("oddsat") * 16
         let rollSlope = eff("rolloff") * 6
         let decaySec  = pow(eff("reverb"), 1.5) * 60
         let gdScale   = eff("gd") * 20
@@ -66,9 +68,13 @@ extension AppState {
         let blurRel    = 0.10 + blur * 2.40
         let shimmer    = eff("shimmer")
         let shimMixDb  = shimmer > 0 ? 20 * log10(shimmer) : -Double.infinity
+        let recipe     = SaturatorRecipe.named(satRecipe)
+        let hyst       = eff("hyst")
+        let sag        = eff("sag")
         let shimRT     = shimmer > 0 ? 0.095 * 3 / -log10(0.40 + 0.50 * shimmer) : 0   // loop trip / dB per trip → RT60
 
         let thd = THDMeter(preampDb: preampDb, eqDb: eqDb, evenDb: evenDb, oddDb: oddDb,
+                           recipe: recipe, hysteresis: hyst, sag: sag,
                            rolloff: rollSlope, compressor: dynamicsMode == .compressor)
         let (thd100, h2, h3) = thd.measure(frequency: 100)
         let (thd1k, _, _)    = thd.measure(frequency: 1000)
@@ -86,6 +92,13 @@ extension AppState {
                 .init(label: "Even saturator", value: String(format: "%.1f dB drive, tube-biased tanh", evenDb)),
                 .init(label: "Odd saturator",  value: String(format: "%.1f dB drive, symmetric tanh", oddDb)),
                 .init(label: "High roll-off",  value: String(format: "%.1f dB/oct above 1 kHz (%.1f dB @ 10 kHz)", rollSlope, -roll10k)),
+                .init(label: "Recipe",         value: recipe.name == "Classic" ? "Classic (plain even/odd)" : "\(recipe.name): \(recipe.blurb)"),
+                .init(label: "Tape hysteresis", value: hyst > 0.001
+                      ? String(format: "%.0f%%: %.1f× drive, loop %.0f%% of level, +%.1f dB head bump @ 90 Hz", hyst * 100, 1 + 2 * hyst, hyst * 28, 2.5 * hyst)
+                      : "off"),
+                .init(label: "Tape sag",       value: sag > 0.001
+                      ? String(format: "%.0f%%: up to −%.1f dB dip, top → %.0f kHz, %.1f ms motor droop", sag * 100, -20 * log10(1 - 0.5 * sag), (18000 - 12000 * sag) / 1000, 4 * sag)
+                      : "off"),
                 .init(label: "Subsonic cut",   value: "12 dB/oct below 25 Hz"),
             ]),
             .init(title: "SPECTRAL HAZE", rows: [
@@ -189,7 +202,14 @@ extension AppState {
             (grain, "The Memory Collector", "hears every song as if it already happened once"),
             (blur, "The Soft-Focus Romantic", "lets every note melt before it lands"),
             (shimmer, "The Basement Choir Director", "keeps an octave-down choir on standby"),
+            ((hyst + sag) / 2, "The Tape Whisperer", "can hear the reels turning"),
         ]
+        switch hyst + sag {
+        case ..<0.05: break
+        case ..<0.4:  like.append("Tape: a mixtape that's only been played a few times")
+        case ..<0.9:  like.append("Tape: a cassette that survived three summers on a dashboard")
+        default:      like.append("Tape: a reel-to-reel wheezing heroically through the chorus")
+        }
         let top = traits.max { $0.0 < $1.0 }!
         let archetype = top.0 < 0.1 ? "The Purist" : top.1
         let tagline = top.0 < 0.1 ? "likes their music exactly as it left the studio" : top.2
@@ -212,7 +232,7 @@ extension AppState {
         var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         (NSColor(waveColor).usingColorSpace(.sRGB) ?? .systemTeal).getHue(&h, saturation: &s, brightness: &b, alpha: &a)
 
-        return ListenerReport(macro: m, macroNote: macroNote, thd100: thd100, thd1k: thd1k,
+        return ListenerReport(macro: m, macroNote: macroNote, presetName: selectedPreset, thd100: thd100, thd1k: thd1k,
                               evenOddDb: evenOdd, archetype: archetype, tagline: tagline,
                               sections: sections, soundsLike: like, pairings: pairings,
                               cozyIndex: cozy, hue: Double(h))
@@ -233,21 +253,27 @@ extension AppState {
 // MARK: - THD measurement
 
 /// Runs a sine through fresh copies of the nonlinear "Color" chain (preamp →
-/// EQ → +7 dB → subsonic → even sat → odd sat → roll-off → dynamics),
+/// EQ → +7 dB → subsonic → recipe → even sat → odd sat → tape hysteresis →
+/// tape sag → roll-off → dynamics),
 /// configured like the live chain, and measures harmonics 2–10 with
 /// Goertzel. Reverb and group delay are linear (no harmonics) and skipped.
 /// Input: sine at −6 dB below a full-scale BlackHole signal (0.5 peak),
 /// entering the pre-amp.
 struct THDMeter {
     let preampDb: Double, eqDb: Double, evenDb: Double, oddDb: Double
+    let recipe: SaturatorRecipe, hysteresis: Double, sag: Double
     let rolloff: Double, compressor: Bool
 
     /// Returns (THD %, H2 amplitude, H3 amplitude).
     func measure(frequency f: Double) -> (Double, Double, Double) {
         let sr = 44100.0, n = 44100 * 2
         let eq = PeakingBiquad(); eq.setParameters(frequency: 150, q: 0.1, gainDb: eqDb)
-        let ev = WebAudioSaturator(voicing: .even); ev.setDrive(driveDb: evenDb)
-        let od = WebAudioSaturator(voicing: .odd);  od.setDrive(driveDb: oddDb)
+        let ev = WebAudioSaturator(voicing: .even); ev.setDrive(driveDb: min(24, evenDb * recipe.evenMul))
+        ev.setBias(recipe.bias)
+        let od = WebAudioSaturator(voicing: .odd);  od.setDrive(driveDb: min(24, oddDb * recipe.oddMul))
+        let rs = RecipeStage(); rs.configure(recipe, amount: (evenDb + oddDb) / 16)
+        let th = TapeHysteresis(); th.setStrength(hysteresis)
+        let sg = TapeSag(); sg.setStrength(sag)
         let ro = HighRolloff(); ro.setSlope(dbPerOctave: rolloff)
         let ss = SubsonicFilter()
         let dyn = WebAudioCompressor(); dyn.setSampleRate(sr)
@@ -263,8 +289,12 @@ struct THDMeter {
             let p = b.baseAddress!
             eq.process(p, count: n, channel: 0)
             ss.process(p, count: n, channel: 0)
+            rs.pre(p, count: n, channel: 0)
             ev.process(p, count: n, channel: 0)
             od.process(p, count: n, channel: 0)
+            rs.post(p, count: n, channel: 0)
+            th.process(p, count: n, channel: 0)
+            sg.process(left: p, right: nil, count: n)
             ro.process(p, count: n, channel: 0)
             dyn.process(left: p, right: nil, count: n)
         }
@@ -336,6 +366,7 @@ struct ListenerReportCard: View {
             HStack(spacing: 16) {
                 pill(String(format: "MACRO %.0f%%", r.macro), r.macroNote)
                 pill("COZY INDEX \(r.cozyIndex)/100", cozyWord)
+                pill("PRESET", r.presetName)
             }
 
             ForEach(r.sections, id: \.title) { sec in
@@ -379,7 +410,7 @@ struct ListenerReportCard: View {
                 .font(.system(size: 12, design: .monospaced)).foregroundColor(dim)
         }
         .padding(48)
-        .frame(width: 1080, height: 1560, alignment: .topLeading)
+        .frame(width: 1080, height: 1680, alignment: .topLeading)
         .background(
             LinearGradient(colors: [hue(s: 0.55, b: 0.16), hue(0.06, s: 0.45, b: 0.08), Color.black],
                            startPoint: .topLeading, endPoint: .bottomTrailing))
@@ -448,7 +479,7 @@ enum ListenerReportRenderer {
             return NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
         }
         let host = NSHostingView(rootView: card)
-        host.frame = NSRect(x: 0, y: 0, width: 1080, height: 1560)
+        host.frame = NSRect(x: 0, y: 0, width: 1080, height: 1680)
         host.layoutSubtreeIfNeeded()
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return nil }
         host.cacheDisplay(in: host.bounds, to: rep)

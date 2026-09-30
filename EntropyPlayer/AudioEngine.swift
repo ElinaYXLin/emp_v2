@@ -39,7 +39,8 @@ final class AudioEngine {
     // re-enters through dspSourceNode, whose render callback runs the whole
     // chain inline:
     //   group delay → spectral blur → grain echo → reverb → shimmer → EQ → +7 dB → 25 Hz high-pass → even sat → odd sat → high roll-off
-    //   → limiter/compressor → post-gain → output ceiling
+    //   (with recipe shaping around the saturators) → tape hysteresis → tape sag
+//   → high roll-off → limiter/compressor → post-gain → output ceiling
     //
     // This used to be four chained tap→ring→source-node bridges, one per
     // stage. Taps deliver audio in ~100 ms chunks (4410 frames, whatever
@@ -86,6 +87,12 @@ final class AudioEngine {
     private let oddSatFilter  = WebAudioSaturator(voicing: .odd)
     private let highRolloff   = HighRolloff()
     private let subsonic      = SubsonicFilter()
+    // Saturator recipe shaping and tape stages (see SaturatorRecipes.swift, Tape.swift).
+    private let recipeStage   = RecipeStage()
+    private let tapeHyst      = TapeHysteresis()
+    private let tapeSag       = TapeSag()
+    private var evenDriveDb: Float = 0, oddDriveDb: Float = 0
+    private var recipe = SaturatorRecipe.classic
 
     // Custom dynamics (see CustomDynamics.swift): replaces Apple's
     // AUDynamicsProcessor, which sounds fundamentally different from Web
@@ -351,10 +358,15 @@ final class AudioEngine {
         for ch in 0..<2 {
             let buf = ch == 0 ? l : r
             subsonic.process(buf, count: n, channel: ch)
+            recipeStage.pre(buf, count: n, channel: ch)
             satFilter.process(buf, count: n, channel: ch)
             oddSatFilter.process(buf, count: n, channel: ch)
-            highRolloff.process(buf, count: n, channel: ch)
+            recipeStage.post(buf, count: n, channel: ch)
+            tapeHyst.process(buf, count: n, channel: ch)
         }
+        tapeSag.process(left: l, right: r, count: n)
+        highRolloff.process(l, count: n, channel: 0)
+        highRolloff.process(r, count: n, channel: 1)
 
         compressor.process(left: l, right: r, count: n)
 
@@ -446,14 +458,39 @@ final class AudioEngine {
         eqFilter.setParameters(gainDb: Double(gainDb))
     }
 
-    /// Even saturator: 0–8 dB drive, envelope-biased tanh (2nd/4th harmonics).
+    /// Even saturator: 0–16 dB drive (× recipe multiplier), envelope-biased tanh.
     func setSaturator(driveDb: Float) {
-        satFilter.setDrive(driveDb: Double(driveDb))
+        evenDriveDb = driveDb
+        applySaturation()
     }
 
-    /// Odd saturator: 0–8 dB drive, the web edition's plain tanh soft-clip.
+    /// Odd saturator: 0–16 dB drive (× recipe multiplier), plain tanh soft-clip.
     func setOddSaturator(driveDb: Float) {
-        oddSatFilter.setDrive(driveDb: Double(driveDb))
+        oddDriveDb = driveDb
+        applySaturation()
+    }
+
+    /// Saturator recipe: shaping, drive balance and harmonic recipe around the saturators.
+    func setSaturatorRecipe(_ r: SaturatorRecipe) {
+        recipe = r
+        applySaturation()
+    }
+
+    private func applySaturation() {
+        satFilter.setDrive(driveDb: min(24, Double(evenDriveDb) * recipe.evenMul))
+        oddSatFilter.setDrive(driveDb: min(24, Double(oddDriveDb) * recipe.oddMul))
+        satFilter.setBias(recipe.bias)
+        recipeStage.configure(recipe, amount: Double(evenDriveDb + oddDriveDb) / 16)
+    }
+
+    /// Tape hysteresis: effective 0–1 (drive, loop width, head bump, top-end loss).
+    func setTapeHysteresis(effective eff: Float) {
+        tapeHyst.setStrength(Double(eff))
+    }
+
+    /// Tape sag: effective 0–1 (level dip, dulling, pitch droop on loud passages).
+    func setTapeSag(effective eff: Float) {
+        tapeSag.setStrength(Double(eff))
     }
 
     /// High roll-off: 0–6 dB/octave slope above 1 kHz.

@@ -26,7 +26,9 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             topBar
-            mainGrid
+            // The knob area is taller than many laptop screens; let it scroll
+            // so the top bar and transport are never pushed off-window.
+            ScrollView(.vertical) { mainGrid }
             transport
         }
         .background(Color(hex: "#0f0d0b"))
@@ -58,6 +60,8 @@ struct ContentView: View {
 
             // Row 2
             HStack(spacing: 8) {
+                presetPicker
+                Divider().frame(height: 22)
                 dynamicsToggle
                 macroModeToggle
                 if app.macroMode == .vibrato {
@@ -150,6 +154,19 @@ struct ContentView: View {
                 app.playlist.order = .shuffle
             }
             .buttonStyle(EntBtn(active: app.playlist.order == .shuffle))
+        }
+    }
+
+    var presetPicker: some View {
+        HStack(spacing: 4) {
+            Text("PRESET").font(.system(size: 9, design: .monospaced)).foregroundColor(Color(hex:"#8f8778"))
+                .fixedSize()
+            Picker("", selection: Binding(get: { app.selectedPreset }, set: { app.applyPreset(named: $0) })) {
+                ForEach(GlobalPreset.all, id: \.name) { p in Text(p.name).tag(p.name) }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 250)
         }
     }
 
@@ -269,14 +286,15 @@ struct ContentView: View {
     var macroPanel: some View {
         ZStack {
             panelBG
+            VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 22) {
                 knobGroup("Color") {
                     knobRow(key: "eq",      label: "Lo-Mid EQ", sub: "Gain",
                             display: { String(format: "%.1fdB", $0/100*12) })
                     knobRow(key: "sat",     label: "Even Sat",  sub: "Gain",
-                            display: { String(format: "%.1fdB", $0/100*8) })
+                            display: { String(format: "%.1fdB", $0/100*16) })
                     knobRow(key: "oddsat",  label: "Odd Sat",   sub: "Gain",
-                            display: { String(format: "%.1fdB", $0/100*8) })
+                            display: { String(format: "%.1fdB", $0/100*16) })
                     knobRow(key: "rolloff", label: "High Roll", sub: "dB/oct >1k",
                             display: { String(format: "%.1fdB/oct", $0/100*6) })
                 }
@@ -297,13 +315,47 @@ struct ContentView: View {
                             display: { String(format: "%.0fms", $0/100*200) })
                 }
             }
+            Divider().background(Color.black.opacity(0.5))
+            bottomZone
+            }
             .padding(14)
         }
         .frame(width: 740)
     }
 
+    // Bottom zone: saturator recipe on the left, tape stages on the right.
+    var bottomZone: some View {
+        HStack(alignment: .top, spacing: 22) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("SATURATOR RECIPES")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(Color(hex:"#d9d1bf").opacity(0.35))
+                Picker("", selection: Binding(get: { app.satRecipe }, set: { app.setRecipe($0) })) {
+                    ForEach(SaturatorRecipe.all, id: \.name) { r in Text(r.name).tag(r.name) }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 200)
+                Text(SaturatorRecipe.named(app.satRecipe).blurb)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(Color(hex:"#8f8778"))
+                    .frame(width: 200, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            knobGroup("Tape") {
+                knobRow(key: "hyst", label: "Hysteresis", sub: "Tape memory",
+                        display: { "\(Int($0))%" })
+            }
+            knobGroup(" ") {
+                knobRow(key: "sag",  label: "Tape Sag",   sub: "Motor strain",
+                        display: { "\(Int($0))%" })
+            }
+        }
+    }
+
     func knobGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 12) {
             Text(title.uppercased())
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundColor(Color(hex:"#d9d1bf").opacity(0.35))

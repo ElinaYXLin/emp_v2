@@ -49,7 +49,7 @@ final class WebAudioSaturator {
     private var postGain: Double = 1.0
 
     /// Bias as a fraction of the envelope — sets the even/odd balance.
-    private static let biasAmount = 0.5
+    private var biasAmount = 0.5
     private static let sampleRate = 44100.0
     private static let attackCoef  = 1 - exp(-1 / (0.050 * sampleRate))
     private static let releaseCoef = 1 - exp(-1 / (0.400 * sampleRate))
@@ -65,7 +65,14 @@ final class WebAudioSaturator {
     // Per-channel filter state, owned by the audio thread.
     private var env:  [Double] = [0, 0]
 
-    /// driveDb: 0–8 dB, matches the web edition's `eff * 8` range exactly.
+    /// driveDb: 0–16 dB (the web edition used 0–8; doubled for more warmth).
+    /// Even voicing: bias as a fraction of the envelope (sets even/odd balance).
+    func setBias(_ b: Double) {
+        lock.lock()
+        biasAmount = max(0, min(1, b))
+        lock.unlock()
+    }
+
     func setDrive(driveDb: Double) {
         lock.lock()
         let d = pow(10, driveDb / 20)
@@ -77,7 +84,7 @@ final class WebAudioSaturator {
 
     func process(_ buffer: UnsafeMutablePointer<Float>, count: Int, channel: Int) {
         lock.lock()
-        let drive = driveLin, tdrive = tanhDrive, post = postGain
+        let drive = driveLin, tdrive = tanhDrive, post = postGain, biasAmt = biasAmount
         lock.unlock()
 
         if voicing == .odd {
@@ -100,7 +107,7 @@ final class WebAudioSaturator {
             // Envelope follower (50 ms attack / 400 ms release) → tube-style bias.
             let mag = abs(xScaled)
             e += (mag > e ? Self.attackCoef : Self.releaseCoef) * (mag - e)
-            let bias = Self.biasAmount * e
+            let bias = biasAmt * e
 
             // Biased waveshaper, re-centered so silence stays at zero.
             let shaped = tanh(xScaled + bias) - tanh(bias)
