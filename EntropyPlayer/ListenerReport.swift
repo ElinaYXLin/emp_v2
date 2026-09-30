@@ -236,7 +236,8 @@ extension AppState {
 /// EQ → +7 dB → subsonic → even sat → odd sat → roll-off → dynamics),
 /// configured like the live chain, and measures harmonics 2–10 with
 /// Goertzel. Reverb and group delay are linear (no harmonics) and skipped.
-/// Input: −12 dBFS sine.
+/// Input: sine at −6 dB below a full-scale BlackHole signal (0.5 peak),
+/// entering the pre-amp.
 struct THDMeter {
     let preampDb: Double, eqDb: Double, evenDb: Double, oddDb: Double
     let rolloff: Double, compressor: Bool
@@ -256,7 +257,7 @@ struct THDMeter {
             dyn.configure(thresholdDb: 0, kneeDb: 0, ratio: 20, attackSec: 0.001, releaseSec: 0.1, trimDb: -6)
         }
 
-        let amp = 0.25 * pow(10, preampDb / 20) * pow(10, 7.0 / 20)
+        let amp = 0.5 * pow(10, preampDb / 20) * pow(10, 7.0 / 20)
         var x = (0..<n).map { Float(amp * sin(2 * Double.pi * f * Double($0) / sr)) }
         x.withUnsafeMutableBufferPointer { b in
             let p = b.baseAddress!
@@ -321,7 +322,7 @@ struct ListenerReportCard: View {
                     scoreBlock(String(format: "%.2f%%", r.thd100), "@ 100 Hz")
                     scoreBlock(String(format: "%.2f%%", r.thd1k), "@ 1 kHz")
                 }
-                Text("−12 dBFS sine through your Color chain")
+                Text("−6 dBFS sine (re full-scale input) through pre-amp + Color chain")
                     .font(.system(size: 13, design: .monospaced)).foregroundColor(dim)
             }
 
