@@ -23,6 +23,7 @@
 		AA2000000000000000000016 /* PartitionedConvolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000016 /* PartitionedConvolver.swift */; };
 		AA2000000000000000000017 /* ListenerReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000017 /* ListenerReport.swift */; };
 		AA2000000000000000000018 /* GrainEcho.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000018 /* GrainEcho.swift */; };
+		AA2000000000000000000024 /* ReportMeasurements.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000024 /* ReportMeasurements.swift */; };
 		AA2000000000000000000023 /* Presets.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000023 /* Presets.swift */; };
 		AA2000000000000000000022 /* Tape.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000022 /* Tape.swift */; };
 		AA2000000000000000000021 /* SaturatorRecipes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1000000000000000000021 /* SaturatorRecipes.swift */; };
@@ -50,6 +51,7 @@
 		AA1000000000000000000016 /* PartitionedConvolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PartitionedConvolver.swift; sourceTree = "<group>"; };
 		AA1000000000000000000017 /* ListenerReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListenerReport.swift; sourceTree = "<group>"; };
 		AA1000000000000000000018 /* GrainEcho.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GrainEcho.swift; sourceTree = "<group>"; };
+		AA1000000000000000000024 /* ReportMeasurements.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReportMeasurements.swift; sourceTree = "<group>"; };
 		AA1000000000000000000023 /* Presets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Presets.swift; sourceTree = "<group>"; };
 		AA1000000000000000000022 /* Tape.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tape.swift; sourceTree = "<group>"; };
 		AA1000000000000000000021 /* SaturatorRecipes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaturatorRecipes.swift; sourceTree = "<group>"; };
@@ -95,6 +97,7 @@
 				AA1000000000000000000016 /* PartitionedConvolver.swift */,
 				AA1000000000000000000017 /* ListenerReport.swift */,
 				AA1000000000000000000018 /* GrainEcho.swift */,
+				AA1000000000000000000024 /* ReportMeasurements.swift */,
 				AA1000000000000000000023 /* Presets.swift */,
 				AA1000000000000000000022 /* Tape.swift */,
 				AA1000000000000000000021 /* SaturatorRecipes.swift */,
@@ -198,6 +201,7 @@
 				AA2000000000000000000016 /* PartitionedConvolver.swift in Sources */,
 				AA2000000000000000000017 /* ListenerReport.swift in Sources */,
 				AA2000000000000000000018 /* GrainEcho.swift in Sources */,
+				AA2000000000000000000024 /* ReportMeasurements.swift in Sources */,
 				AA2000000000000000000023 /* Presets.swift in Sources */,
 				AA2000000000000000000022 /* Tape.swift in Sources */,
 				AA2000000000000000000021 /* SaturatorRecipes.swift in Sources */,

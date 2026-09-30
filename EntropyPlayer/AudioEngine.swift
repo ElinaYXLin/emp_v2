@@ -113,10 +113,11 @@ final class AudioEngine {
     // web edition's very wide Q 0.1 bell.
     private let eqFilter     = PeakingBiquad()
 
-    // Fixed, always-on +7 dB drive into the saturator/limiter. Not exposed as
-    // a control — the visible Pre-Amp slider's "0 dB" position stays the web
-    // edition's nominal unity gain; this compensates for headroom the chain
-    // otherwise loses (e.g. AUReverb2's internal dry-path insertion loss).
+    // Fixed +7 dB drive *into the saturation stage only*, undone right after
+    // it (after tape sag), so it sets how hard the saturators/tape are hit
+    // without raising the level that reaches the limiter. (It used to stay
+    // in the signal — a leftover from compensating AUReverb2's insertion
+    // loss — and pushed everything 7 dB hotter into the limiter.)
     private let preLimiterGainLinear: Float = pow(10, 7.0 / 20.0)
 
     // MARK: - Tap output
@@ -365,6 +366,9 @@ final class AudioEngine {
             tapeHyst.process(buf, count: n, channel: ch)
         }
         tapeSag.process(left: l, right: r, count: n)
+        var gInv = 1 / preLimiterGainLinear
+        vDSP_vsmul(l, 1, &gInv, l, 1, vDSP_Length(n))
+        vDSP_vsmul(r, 1, &gInv, r, 1, vDSP_Length(n))
         highRolloff.process(l, count: n, channel: 0)
         highRolloff.process(r, count: n, channel: 1)
 

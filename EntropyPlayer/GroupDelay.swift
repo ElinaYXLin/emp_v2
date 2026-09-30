@@ -92,6 +92,12 @@ final class GroupDelay {
         }
     }
 
+    /// Blocks until pending parameter changes (and their filter redesigns)
+    /// have been applied — for offline measurement, not the audio thread.
+    func flushParameters() {
+        paramQueue.sync {}
+    }
+
     /// randomness: max deviation as a fraction of the scale (0…0.5).
     func setRandomness(_ r: Double) {
         paramQueue.async { [weak self] in

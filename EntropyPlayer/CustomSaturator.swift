@@ -64,6 +64,10 @@ final class WebAudioSaturator {
 
     // Per-channel filter state, owned by the audio thread.
     private var env:  [Double] = [0, 0]
+    // Loudness makeup state per channel: smoothed input / output power.
+    private var pIn:  [Double] = [0, 0]
+    private var pOut: [Double] = [0, 0]
+    private static let powerCoef = 1 - exp(-1 / (0.300 * sampleRate))
 
     /// driveDb: 0–16 dB (the web edition used 0–8; doubled for more warmth).
     /// Even voicing: bias as a fraction of the envelope (sets even/odd balance).
@@ -78,26 +82,45 @@ final class WebAudioSaturator {
         let d = pow(10, driveDb / 20)
         driveLin  = d
         tanhDrive = tanh(max(d, 0.001))
-        postGain  = 1 / max(d, 1)
+        // Level normalization, two parts:
+        // 1. Unity small-signal gain: the curve's input is scaled by d², so
+        //    divide by d² after it (|tanh u| ≤ |u| → never louder).
+        // 2. Loudness makeup (in process): input and output power are tracked
+        //    with the same 300 ms smoothing and the output is scaled so its
+        //    RMS matches the input's. Clipping lowers the crest factor, so at
+        //    matched RMS the peaks still come out at or below the input's —
+        //    loudness-neutral, never hotter into the limiter.
+        // (The web edition's 1/tanh(d)·1/max(d,1) scaling left quiet material
+        // up to d/tanh(d) louder: +2.4 dB at 0 dB drive, ~+16 dB at 16 dB.)
+        postGain  = 1 / (d * d)
         lock.unlock()
     }
 
     func process(_ buffer: UnsafeMutablePointer<Float>, count: Int, channel: Int) {
         lock.lock()
-        let drive = driveLin, tdrive = tanhDrive, post = postGain, biasAmt = biasAmount
+        let drive = driveLin, post = postGain, biasAmt = biasAmount
         lock.unlock()
+
+        let ch = min(max(channel, 0), 1)
+        var pi = pIn[ch], po = pOut[ch]
+        let maxMakeup = 1 / post
+        @inline(__always) func makeup(_ x: Double, _ y: Double) -> Double {
+            pi += Self.powerCoef * (x * x - pi)
+            po += Self.powerCoef * (y * y - po)
+            return max(1, min(maxMakeup, ((pi + 1e-12) / (po + 1e-12)).squareRoot()))
+        }
 
         if voicing == .odd {
             for i in 0..<count {
                 let xOrig   = Double(buffer[i])
                 let xScaled = xOrig * drive              // preGain
-                let y       = tanh(xScaled * drive) / tdrive  // waveshaper curve
-                buffer[i]   = Float(y * post)             // postGain
+                let y       = tanh(xScaled * drive) * post   // unity small-signal gain
+                buffer[i]   = Float(y * makeup(xOrig, y))
             }
+            pIn[ch] = pi; pOut[ch] = po
             return
         }
 
-        let ch = min(max(channel, 0), 1)
         var e = env[ch]
         var st = hpState[ch]
         for i in 0..<count {
@@ -122,8 +145,10 @@ final class WebAudioSaturator {
                 y = out
             }
 
-            buffer[i] = Float(y / tdrive * post)       // curve normalize + postGain
+            let yn = y * post                          // unity small-signal gain
+            buffer[i] = Float(yn * makeup(xOrig, yn))
         }
         env[ch] = e; hpState[ch] = st
+        pIn[ch] = pi; pOut[ch] = po
     }
 }

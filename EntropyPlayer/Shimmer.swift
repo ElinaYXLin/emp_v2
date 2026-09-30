@@ -143,8 +143,11 @@ final class Shimmer {
             loopBuf[1][loopIdx] = outs.1
             loopIdx = loopIdx + 1 == Self.loopDelay ? 0 : loopIdx + 1
 
-            left[i] = l + outs.0 * mix
-            right?[i] = r + outs.1 * mix
+            // Level compensation (measured on pink noise): the sustained glow
+            // otherwise adds up to ~4.3 dB at full strength.
+            let comp = Float(1 / (1 + 1.69 * pow(strength, 3.5)).squareRoot())
+            left[i] = (l + outs.0 * mix) * comp
+            right?[i] = (r + outs.1 * mix) * comp
         }
     }
 }

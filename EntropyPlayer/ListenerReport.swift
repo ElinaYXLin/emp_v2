@@ -18,6 +18,10 @@ struct ListenerReport {
     let presetName: String
     let thd100: Double          // %
     let thd1k: Double           // %
+    let thdn100: Double, thdn1k: Double     // %
+    let imdPercent: Double      // multitone: % of output power that is new frequencies
+    let c50Db: Double           // smear clarity
+    let centerTimeMs: Double
     let evenOddDb: Double       // H2 − H3 at 100 Hz, dB (positive = even-dominant)
     let archetype: String
     let tagline: String
@@ -73,12 +77,15 @@ extension AppState {
         let sag        = eff("sag")
         let shimRT     = shimmer > 0 ? 0.095 * 3 / -log10(0.40 + 0.50 * shimmer) : 0   // loop trip / dB per trip → RT60
 
-        let thd = THDMeter(preampDb: preampDb, eqDb: eqDb, evenDb: evenDb, oddDb: oddDb,
-                           recipe: recipe, hysteresis: hyst, sag: sag,
-                           rolloff: rollSlope, compressor: dynamicsMode == .compressor)
-        let (thd100, h2, h3) = thd.measure(frequency: 100)
-        let (thd1k, _, _)    = thd.measure(frequency: 1000)
-        let evenOdd = 20 * log10(max(h2, 1e-9) / max(h3, 1e-9))
+        var cs = ChainSettings()
+        cs.preampDb = preampDb; cs.eqDb = eqDb; cs.evenDb = evenDb; cs.oddDb = oddDb
+        cs.recipe = recipe; cs.hysteresis = hyst; cs.sag = sag; cs.rolloff = rollSlope
+        cs.compressor = dynamicsMode == .compressor
+        cs.gdScale = gdScale; cs.blur = blur; cs.grain = grain
+        cs.reverbDecaySec = decaySec; cs.shimmer = shimmer
+        let meas = ReportMeasurer.measure(cs)
+        let thd100 = meas.thd100, thd1k = meas.thd1k
+        let evenOdd = 20 * log10(max(meas.h2, 1e-9) / max(meas.h3, 1e-9))
 
         let gd100ms = min(1600, gdScale / 100 * 1000)
         let gd50ms  = min(1600, gdScale / 50 * 1000)
@@ -204,6 +211,19 @@ extension AppState {
             (shimmer, "The Basement Choir Director", "keeps an octave-down choir on standby"),
             ((hyst + sag) / 2, "The Tape Whisperer", "can hear the reels turning"),
         ]
+        switch meas.imdPercent {
+        case ..<3:  like.append("Intermod: every instrument keeps to its own lane")
+        case ..<10: like.append("Intermod: a friendly crowd where voices blend a little")
+        case ..<25: like.append("Intermod: a busy café where conversations tangle")
+        default:    like.append("Intermod: soup — delicious, but you can't tell the vegetables apart")
+        }
+        switch meas.c50Db {
+        case 15...:    like.append("Smear: crisp as a studio booth")
+        case 5..<15:   like.append("Smear: a cozy room with soft furniture")
+        case -5..<5:   like.append("Smear: a stairwell where every note hangs around")
+        case -15..<(-5): like.append("Smear: a cathedral full of fog")
+        default:       like.append("Smear: sound dissolving into a warm cloud")
+        }
         switch hyst + sag {
         case ..<0.05: break
         case ..<0.4:  like.append("Tape: a mixtape that's only been played a few times")
@@ -233,6 +253,8 @@ extension AppState {
         (NSColor(waveColor).usingColorSpace(.sRGB) ?? .systemTeal).getHue(&h, saturation: &s, brightness: &b, alpha: &a)
 
         return ListenerReport(macro: m, macroNote: macroNote, presetName: selectedPreset, thd100: thd100, thd1k: thd1k,
+                              thdn100: meas.thdn100, thdn1k: meas.thdn1k, imdPercent: meas.imdPercent,
+                              c50Db: meas.c50Db, centerTimeMs: meas.centerTimeMs,
                               evenOddDb: evenOdd, archetype: archetype, tagline: tagline,
                               sections: sections, soundsLike: like, pairings: pairings,
                               cozyIndex: cozy, hue: Double(h))
@@ -247,76 +269,6 @@ extension AppState {
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         guard panel.runModal() == .OK, let url = panel.url else { return }
         try? png.write(to: url)
-    }
-}
-
-// MARK: - THD measurement
-
-/// Runs a sine through fresh copies of the nonlinear "Color" chain (preamp →
-/// EQ → +7 dB → subsonic → recipe → even sat → odd sat → tape hysteresis →
-/// tape sag → roll-off → dynamics),
-/// configured like the live chain, and measures harmonics 2–10 with
-/// Goertzel. Reverb and group delay are linear (no harmonics) and skipped.
-/// Input: sine at −6 dB below a full-scale BlackHole signal (0.5 peak),
-/// entering the pre-amp.
-struct THDMeter {
-    let preampDb: Double, eqDb: Double, evenDb: Double, oddDb: Double
-    let recipe: SaturatorRecipe, hysteresis: Double, sag: Double
-    let rolloff: Double, compressor: Bool
-
-    /// Returns (THD %, H2 amplitude, H3 amplitude).
-    func measure(frequency f: Double) -> (Double, Double, Double) {
-        let sr = 44100.0, n = 44100 * 2
-        let eq = PeakingBiquad(); eq.setParameters(frequency: 150, q: 0.1, gainDb: eqDb)
-        let ev = WebAudioSaturator(voicing: .even); ev.setDrive(driveDb: min(24, evenDb * recipe.evenMul))
-        ev.setBias(recipe.bias)
-        let od = WebAudioSaturator(voicing: .odd);  od.setDrive(driveDb: min(24, oddDb * recipe.oddMul))
-        let rs = RecipeStage(); rs.configure(recipe, amount: (evenDb + oddDb) / 16)
-        let th = TapeHysteresis(); th.setStrength(hysteresis)
-        let sg = TapeSag(); sg.setStrength(sag)
-        let ro = HighRolloff(); ro.setSlope(dbPerOctave: rolloff)
-        let ss = SubsonicFilter()
-        let dyn = WebAudioCompressor(); dyn.setSampleRate(sr)
-        if compressor {
-            dyn.configure(thresholdDb: -18, kneeDb: 12, ratio: 4, attackSec: 0.01, releaseSec: 0.25, trimDb: -12)
-        } else {
-            dyn.configure(thresholdDb: 0, kneeDb: 0, ratio: 20, attackSec: 0.001, releaseSec: 0.1, trimDb: -6)
-        }
-
-        let amp = 0.5 * pow(10, preampDb / 20) * pow(10, 7.0 / 20)
-        var x = (0..<n).map { Float(amp * sin(2 * Double.pi * f * Double($0) / sr)) }
-        x.withUnsafeMutableBufferPointer { b in
-            let p = b.baseAddress!
-            eq.process(p, count: n, channel: 0)
-            ss.process(p, count: n, channel: 0)
-            rs.pre(p, count: n, channel: 0)
-            ev.process(p, count: n, channel: 0)
-            od.process(p, count: n, channel: 0)
-            rs.post(p, count: n, channel: 0)
-            th.process(p, count: n, channel: 0)
-            sg.process(left: p, right: nil, count: n)
-            ro.process(p, count: n, channel: 0)
-            dyn.process(left: p, right: nil, count: n)
-        }
-
-        // Analyze the second (settled) second.
-        func goertzel(_ freq: Double) -> Double {
-            var re = 0.0, im = 0.0
-            for i in (n / 2)..<n {
-                let w = 2 * Double.pi * freq * Double(i) / sr
-                re += Double(x[i]) * cos(w); im += Double(x[i]) * sin(w)
-            }
-            return sqrt(re * re + im * im)
-        }
-        let h1 = goertzel(f)
-        var sum = 0.0, h2 = 0.0, h3 = 0.0
-        for k in 2...10 where f * Double(k) < sr / 2 {
-            let hk = goertzel(f * Double(k))
-            if k == 2 { h2 = hk }
-            if k == 3 { h3 = hk }
-            sum += hk * hk
-        }
-        return (h1 > 0 ? sqrt(sum) / h1 * 100 : 0, h2, h3)
     }
 }
 
@@ -354,6 +306,13 @@ struct ListenerReportCard: View {
                 }
                 Text("−6 dBFS sine (re full-scale input) through pre-amp + Color chain")
                     .font(.system(size: 13, design: .monospaced)).foregroundColor(dim)
+                HStack(spacing: 14) {
+                    metric("THD+N", String(format: "%.1f%% / %.1f%%", r.thdn100, r.thdn1k), "incl. aliasing & noise")
+                    metric("INTERMOD", String(format: "%.1f%%", r.imdPercent), "5-tone, new freqs")
+                    metric("CLARITY C50", r.c50Db.isFinite ? String(format: "%+.1f dB", r.c50Db) : "∞", "click: first 50 ms vs rest")
+                    metric("CENTRE TIME", String(format: "%.0f ms", r.centerTimeMs), "where a click's energy lands")
+                }
+                .padding(.top, 6)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -406,11 +365,12 @@ struct ListenerReportCard: View {
 
             Spacer(minLength: 0)
             wave.frame(height: 60)
-            Text("Comparisons are vibes, not science.")
+            Text("THD tops out near 48% (a square wave) however hard you clip; Intermod and Clarity track how mushy music actually gets. Comparisons are vibes, not science.")
                 .font(.system(size: 12, design: .monospaced)).foregroundColor(dim)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(48)
-        .frame(width: 1080, height: 1680, alignment: .topLeading)
+        .frame(width: 1080, height: 1780, alignment: .topLeading)
         .background(
             LinearGradient(colors: [hue(s: 0.55, b: 0.16), hue(0.06, s: 0.45, b: 0.08), Color.black],
                            startPoint: .topLeading, endPoint: .bottomTrailing))
@@ -429,6 +389,15 @@ struct ListenerReportCard: View {
         case ..<70: return "blanket weather"
         default:    return "maximum hibernation"
         }
+    }
+
+    private func metric(_ title: String, _ value: String, _ sub: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(accent2)
+            Text(value).font(.system(size: 20, weight: .bold, design: .monospaced)).foregroundColor(ink)
+            Text(sub).font(.system(size: 10, design: .monospaced)).foregroundColor(dim)
+        }
+        .frame(width: 230, alignment: .leading)
     }
 
     private func scoreBlock(_ value: String, _ label: String) -> some View {
@@ -479,7 +448,7 @@ enum ListenerReportRenderer {
             return NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
         }
         let host = NSHostingView(rootView: card)
-        host.frame = NSRect(x: 0, y: 0, width: 1080, height: 1680)
+        host.frame = NSRect(x: 0, y: 0, width: 1080, height: 1780)
         host.layoutSubtreeIfNeeded()
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return nil }
         host.cacheDisplay(in: host.bounds, to: rep)

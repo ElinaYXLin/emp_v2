@@ -9,9 +9,9 @@ import Accelerate
 // the live magnitude with a slow attack (bloom) and a much slower release
 // (linger); the output magnitude is interpolated from live toward smoothed
 // by `strength`, which also scales both time constants. Live phase is kept
-// wherever the bin has energy; where only the lingering magnitude remains,
-// the bin continues from its previous phase advanced at its centre
-// frequency, so tails ring on instead of vanishing.
+// wherever the bin has energy; where only the lingering magnitude remains
+// (true silence), the bin gets a random phase each frame so the tail
+// dissolves into a soft wash instead of vanishing.
 //
 // At strength 0 the output is the input exactly (the STFT still runs, so
 // latency — 2048 samples, ~46 ms — stays constant and toggling never jumps).
@@ -39,6 +39,7 @@ final class SpectralBlur {
     private let frame, re, im: UnsafeMutablePointer<Float>
     private var fill = 0
     private var strength: Double = 0
+    private var rng: UInt64 = 0x9E3779B97F4A7C15
 
     init() {
         func buf(_ c: Int) -> UnsafeMutablePointer<Float> {
@@ -117,9 +118,13 @@ final class SpectralBlur {
                     re[k] = x * g; im[k] = y * g
                     ph[k] = atan2f(y, x)
                 } else {
-                    // Only the lingering tail remains: keep ringing at the bin's centre frequency.
-                    let p = ph[k] + Float.pi / 2 * Float(k)     // 2π·k·H/N with H/N = 1/4
-                    ph[k] = p.truncatingRemainder(dividingBy: 2 * .pi)
+                    // Only the lingering tail remains (true silence): give it a
+                    // fresh random phase each frame so it dissolves into a soft
+                    // wash. Continuing the last frame's phases instead replayed
+                    // its time structure every hop — a buzzy click train with
+                    // peaks several times the input's.
+                    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17
+                    let p = Float(rng >> 40) / Float(1 << 24) * 2 * .pi
                     re[k] = out * cosf(p); im[k] = out * sinf(p)
                 }
             }

@@ -149,8 +149,11 @@ final class GrainEcho {
                 if voices[v].phase >= 1 { voices[v].active = false }
             }
 
-            left[i] = l + outL * mix
-            right?[i] = r + outR * mix
+            // Level compensation (measured on pink noise): dry + haze would
+            // otherwise sum up to ~4 dB louder at full strength.
+            let comp = Float(1 / (1 + 1.45 * strength * strength).squareRoot())
+            left[i] = (l + outL * mix) * comp
+            right?[i] = (r + outR * mix) * comp
         }
         if idle { strength = 0 }
     }

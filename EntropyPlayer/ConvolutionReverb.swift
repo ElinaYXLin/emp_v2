@@ -26,6 +26,10 @@ final class ConvolutionReverb {
     private var sampleRate: Double = 44100
 
     private static let maxIRSeconds = 2.0
+    /// The web edition's fixed 0.6 dry + 0.8 wet sums ~2 dB louder than the
+    /// input on real (pink, bursty) program material, at every knob setting.
+    /// Measured and compensated so the reverb never raises the level.
+    private static let levelComp: Float = 0.78
     private let convolver = PartitionedConvolver(
         maxPartitions: Int(44100 * ConvolutionReverb.maxIRSeconds) / PartitionedConvolver.block + 1,
         identityDelay: nil)
@@ -106,8 +110,8 @@ final class ConvolutionReverb {
             dryL.assign(from: l, count: n)
             if let r { dryR.assign(from: r, count: n) }
             convolver.process(left: l, right: r, count: n)     // → wet
-            for i in 0..<n { l[i] = dryL[i] * 0.6 + l[i] * 0.8 }
-            if let r { for i in 0..<n { r[i] = dryR[i] * 0.6 + r[i] * 0.8 } }
+            for i in 0..<n { l[i] = (dryL[i] * 0.6 + l[i] * 0.8) * Self.levelComp }
+            if let r { for i in 0..<n { r[i] = (dryR[i] * 0.6 + r[i] * 0.8) * Self.levelComp } }
             done += n
         }
     }
