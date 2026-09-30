@@ -22,7 +22,12 @@ import Foundation
 // harmonics dominate at every drive setting — measured ~7–20 dB more even
 // than odd content, and ~15 dB less 3rd harmonic than the plain tanh at full
 // drive. The asymmetry produces a level-dependent DC offset, removed by a
-// 10 Hz DC blocker.
+// 10 Hz high-pass (4th-order Butterworth, 24 dB/oct). It's steep because
+// even-order distortion also makes intermodulation difference tones (two
+// bass notes at 55 + 62 Hz → a 7 Hz throb) that a gentle DC blocker let
+// through as an engine-like whirr. The envelope follower is also slow
+// (50 ms attack / 400 ms release) so the bias doesn't track — and
+// re-modulate — individual bass cycles and beats.
 //
 // Two voicings share this class: `.even` (the biased curve above) and `.odd`
 // (the web edition's original plain tanh, kept as its own "Odd Saturator"
@@ -46,14 +51,19 @@ final class WebAudioSaturator {
     /// Bias as a fraction of the envelope — sets the even/odd balance.
     private static let biasAmount = 0.5
     private static let sampleRate = 44100.0
-    private static let attackCoef  = 1 - exp(-1 / (0.005 * sampleRate))
-    private static let releaseCoef = 1 - exp(-1 / (0.150 * sampleRate))
-    private static let dcCoef      = 1 - 2 * Double.pi * 10 / sampleRate
+    private static let attackCoef  = 1 - exp(-1 / (0.050 * sampleRate))
+    private static let releaseCoef = 1 - exp(-1 / (0.400 * sampleRate))
+    // Two cascaded RBJ high-pass biquads, Q = 0.5412 and 1.3066 → 4th-order Butterworth at 10 Hz.
+    private static let hpCoefs: [(b0: Double, b1: Double, b2: Double, a1: Double, a2: Double)] =
+        [0.5411961, 1.3065630].map { q in
+            let w0 = 2 * Double.pi * 10 / sampleRate, alpha = sin(w0) / (2 * q), c = cos(w0), a0 = 1 + alpha
+            return ((1 + c) / 2 / a0, -(1 + c) / a0, (1 + c) / 2 / a0, -2 * c / a0, (1 - alpha) / a0)
+        }
+    // [channel][stage] biquad state: x1, x2, y1, y2
+    private var hpState = [[[Double]]](repeating: [[0, 0, 0, 0], [0, 0, 0, 0]], count: 2)
 
     // Per-channel filter state, owned by the audio thread.
     private var env:  [Double] = [0, 0]
-    private var dcX:  [Double] = [0, 0]
-    private var dcY:  [Double] = [0, 0]
 
     /// driveDb: 0–8 dB, matches the web edition's `eff * 8` range exactly.
     func setDrive(driveDb: Double) {
@@ -81,12 +91,13 @@ final class WebAudioSaturator {
         }
 
         let ch = min(max(channel, 0), 1)
-        var e = env[ch], x1 = dcX[ch], y1 = dcY[ch]
+        var e = env[ch]
+        var st = hpState[ch]
         for i in 0..<count {
             let xOrig   = Double(buffer[i])
             let xScaled = xOrig * drive * drive       // preGain + curve drive
 
-            // Envelope follower (5 ms attack / 150 ms release) → tube-style bias.
+            // Envelope follower (50 ms attack / 400 ms release) → tube-style bias.
             let mag = abs(xScaled)
             e += (mag > e ? Self.attackCoef : Self.releaseCoef) * (mag - e)
             let bias = Self.biasAmount * e
@@ -94,12 +105,18 @@ final class WebAudioSaturator {
             // Biased waveshaper, re-centered so silence stays at zero.
             let shaped = tanh(xScaled + bias) - tanh(bias)
 
-            // DC blocker: y[n] = x[n] - x[n-1] + R·y[n-1]
-            let y = shaped - x1 + Self.dcCoef * y1
-            x1 = shaped; y1 = y
+            // 4th-order high-pass (removes DC and sub-10 Hz difference tones).
+            var y = shaped
+            for k in 0..<2 {
+                let c = Self.hpCoefs[k]
+                let out = c.b0 * y + c.b1 * st[k][0] + c.b2 * st[k][1] - c.a1 * st[k][2] - c.a2 * st[k][3]
+                st[k][1] = st[k][0]; st[k][0] = y
+                st[k][3] = st[k][2]; st[k][2] = out
+                y = out
+            }
 
             buffer[i] = Float(y / tdrive * post)       // curve normalize + postGain
         }
-        env[ch] = e; dcX[ch] = x1; dcY[ch] = y1
+        env[ch] = e; hpState[ch] = st
     }
 }
