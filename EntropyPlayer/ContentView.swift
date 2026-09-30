@@ -162,7 +162,12 @@ struct ContentView: View {
             Text("PRESET").font(.system(size: 9, design: .monospaced)).foregroundColor(Color(hex:"#8f8778"))
                 .fixedSize()
             Picker("", selection: Binding(get: { app.selectedPreset }, set: { app.applyPreset(named: $0) })) {
-                ForEach(GlobalPreset.all, id: \.name) { p in Text(p.name).tag(p.name) }
+                Text(GlobalPreset.initName).tag(GlobalPreset.initName)
+                ForEach(GlobalPreset.Vibe.allCases, id: \.self) { vibe in
+                    Section(header: Text(vibe.rawValue.uppercased())) {
+                        ForEach(GlobalPreset.presets(in: vibe), id: \.name) { p in Text(p.name).tag(p.name) }
+                    }
+                }
             }
             .labelsHidden()
             .pickerStyle(.menu)
