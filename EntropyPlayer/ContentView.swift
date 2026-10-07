@@ -30,6 +30,7 @@ struct ContentView: View {
             // so the top bar and transport are never pushed off-window.
             ScrollView(.vertical) { mainGrid }
             transport
+            ListeningMeterBar(model: app.meter)
         }
         .background(Color(hex: "#0f0d0b"))
         .preferredColorScheme(.dark)

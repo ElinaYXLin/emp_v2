@@ -109,6 +109,9 @@ final class AudioEngine {
     // so pushing Post-Gain up compresses gracefully instead of clipping.
     private let outputCeiling = WebAudioCompressor()
 
+    /// A-weighted level of the final output, for the listening-level meter.
+    let listeningMeter = AWeightedMeter()
+
     // Custom peaking EQ (see CustomEQ.swift): AVAudioUnitEQ can't reach the
     // web edition's very wide Q 0.1 bell.
     private let eqFilter     = PeakingBiquad()
@@ -380,6 +383,8 @@ final class AudioEngine {
         // Safety ceiling: catches any Post-Gain overs gracefully instead
         // of letting them hard-clip at the final hardware conversion.
         outputCeiling.process(left: l, right: r, count: n)
+        // Listening-level meter taps the final output (read-only).
+        listeningMeter.process(left: l, right: r, count: n)
     }
 
     private func setLowLatency() {

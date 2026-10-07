@@ -57,6 +57,14 @@ final class AppState: ObservableObject {
     let audio    = AudioEngine()
     @Published var playlist = PlaylistManager()
 
+    /// Listening-level meter (bottom bar). System volume is converted with
+    /// the current output device's own volume curve.
+    lazy var meter = ListeningMeterModel(meter: audio.listeningMeter) { [weak self] pct in
+        let device = (self?.systemCaptureActive ?? false) ? self?.selectedOutputDeviceID
+                                                          : OutputVolume.defaultOutputDevice()
+        return OutputVolume.decibels(percent: pct, device: device)
+    }
+
     // MARK: Vibrato state
     private var vibratoTimer: Timer?
     private var vibratoOrigin: Double = 0
