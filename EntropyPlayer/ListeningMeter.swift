@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreAudio
+import AppKit
 
 // Listening-level meter: estimates the sound level reaching your ears and
 // tracks exposure against the WHO safe-listening guideline (80 dB(A) for
@@ -119,7 +120,11 @@ final class ListeningMeterModel: ObservableObject {
     @Published private(set) var leqDbA: Double = -.infinity      // last minute
     @Published private(set) var todayMinutes: Double = 0
     @Published private(set) var todayDose: Double = 0            // fraction of WHO weekly allowance
-    @Published private(set) var weekDose: Double = 0             // last 7 days
+    @Published private(set) var weekDose: Double = 0             // rolling last 7 days
+    @Published private(set) var thisWeekHours: Double = 0        // calendar week, Mon–Sun
+    @Published private(set) var thisWeekDose: Double = 0
+    @Published private(set) var lastWeekHours: Double = 0
+    @Published private(set) var lastWeekDose: Double = 0
 
     static let whoReferenceDb = 80.0
     static let whoWeeklySeconds = 40.0 * 3600
@@ -175,43 +180,111 @@ final class ListeningMeterModel: ObservableObject {
         }
     }
 
-    // MARK: History (per-day seconds and dose, last 8 days)
+    // MARK: History
+    //
+    // Per-day listening seconds and dose, kept for a year in a JSON file in
+    // Application Support (the sandbox container). The app is relaunched a
+    // lot — lid closes, headphones unplugged — so the file is rewritten
+    // every 5 s while listening and immediately on quit / sleep; at most a
+    // few seconds can ever be lost. Weekly totals are derived from the days.
 
-    private var history: [String: [Double]] = [:]                // "yyyy-MM-dd": [seconds, dose]
+    private struct DayUsage: Codable { var seconds: Double; var dose: Double }
+    private var history: [String: DayUsage] = [:]                // "yyyy-MM-dd"
+    private var dirty = false
+    private var lastSave = Date.distantPast
+    private var observers: [NSObjectProtocol] = []
 
-    private static func dayKey(_ date: Date = Date()) -> String {
+    private static let historyURL: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = base.appendingPathComponent("EntropyPlayer", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("listening_history.json")
+    }()
+
+    private static let dayFormatter: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX")
-        return f.string(from: date)
-    }
+        return f
+    }()
+
+    private static func dayKey(_ date: Date = Date()) -> String { dayFormatter.string(from: date) }
 
     private func loadHistory() {
-        history = defaults.dictionary(forKey: "meter.history") as? [String: [Double]] ?? [:]
+        if let data = try? Data(contentsOf: Self.historyURL),
+           let h = try? JSONDecoder().decode([String: DayUsage].self, from: data) {
+            history = h
+        } else if let old = defaults.dictionary(forKey: "meter.history") as? [String: [Double]] {
+            // One-time migration from the earlier UserDefaults storage.
+            history = old.mapValues { DayUsage(seconds: $0[0], dose: $0[1]) }
+            dirty = true
+            saveHistory()
+            defaults.removeObject(forKey: "meter.history")
+        }
+        refreshTotals()
+
+        // Flush on quit and before sleep (lid close) so nothing is lost.
+        let nc = NotificationCenter.default, ws = NSWorkspace.shared.notificationCenter
+        for (center, name) in [(nc, NSApplication.willTerminateNotification),
+                               (ws, NSWorkspace.willSleepNotification),
+                               (ws, NSWorkspace.screensDidSleepNotification),
+                               (ws, NSWorkspace.willPowerOffNotification)] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.saveHistory(force: true) }
+            })
+        }
+    }
+
+    private func addToHistory(seconds: Double, dose: Double) {
+        let key = Self.dayKey()
+        var v = history[key] ?? DayUsage(seconds: 0, dose: 0)
+        v.seconds += seconds; v.dose += dose
+        history[key] = v
+        dirty = true
+        if Date().timeIntervalSince(lastSave) >= 5 { saveHistory() }
         refreshTotals()
     }
 
-    private var unsaved = 0
-    private func addToHistory(seconds: Double, dose: Double) {
-        let key = Self.dayKey()
-        var v = history[key] ?? [0, 0]
-        v[0] += seconds; v[1] += dose
-        history[key] = v
-        unsaved += 1
-        if unsaved >= 15 {                                       // persist every ~15 s
-            let keep = Set((0..<8).map { Self.dayKey(Date().addingTimeInterval(-Double($0) * 86400)) })
-            history = history.filter { keep.contains($0.key) }
-            defaults.set(history, forKey: "meter.history")
-            unsaved = 0
+    func saveHistory(force: Bool = false) {
+        guard dirty || force else { return }
+        let cutoff = Self.dayKey(Date().addingTimeInterval(-366 * 86400))
+        history = history.filter { $0.key >= cutoff }            // keys sort chronologically
+        if let data = try? JSONEncoder().encode(history) {
+            try? data.write(to: Self.historyURL, options: .atomic)
         }
-        refreshTotals()
+        dirty = false
+        lastSave = Date()
+    }
+
+    /// Monday of the calendar week containing `date`.
+    private static func weekStart(_ date: Date) -> Date {
+        var cal = Calendar(identifier: .iso8601); cal.timeZone = .current
+        return cal.dateInterval(of: .weekOfYear, for: date)?.start ?? date
+    }
+
+    /// Totals for the calendar week (Mon–Sun) containing `date`.
+    func weekUsage(containing date: Date = Date()) -> (hours: Double, dose: Double) {
+        let start = Self.weekStart(date)
+        var hours = 0.0, dose = 0.0
+        for d in 0..<7 {
+            if let u = history[Self.dayKey(start.addingTimeInterval(Double(d) * 86400 + 3600))] {
+                hours += u.seconds / 3600; dose += u.dose
+            }
+        }
+        return (hours, dose)
     }
 
     private func refreshTotals() {
-        let today = history[Self.dayKey()] ?? [0, 0]
-        todayMinutes = today[0] / 60
-        todayDose = today[1]
+        let today = history[Self.dayKey()] ?? DayUsage(seconds: 0, dose: 0)
+        todayMinutes = today.seconds / 60
+        todayDose = today.dose
         weekDose = (0..<7).reduce(0) { acc, d in
-            acc + (history[Self.dayKey(Date().addingTimeInterval(-Double(d) * 86400))]?[1] ?? 0)
+            acc + (history[Self.dayKey(Date().addingTimeInterval(-Double(d) * 86400))]?.dose ?? 0)
         }
+        let w = weekUsage()
+        thisWeekHours = w.hours
+        thisWeekDose = w.dose
+        let lw = weekUsage(containing: Date().addingTimeInterval(-7 * 86400))
+        lastWeekHours = lw.hours
+        lastWeekDose = lw.dose
     }
 }
 
@@ -283,9 +356,13 @@ struct ListeningMeterBar: View {
             Text("now \(fmt(model.shortDbA))")
                 .font(.system(size: 10, design: .monospaced)).foregroundColor(Color(hex: "#8f8778"))
             Divider().frame(height: 18)
-            stat("TODAY", String(format: "%.0f min · %.0f%%", model.todayMinutes, model.todayDose * 100))
-            stat("7 DAYS", String(format: "%.0f%% of WHO limit", model.weekDose * 100))
-                .foregroundColor(model.weekDose >= 1 ? Color(hex: "#ff5a4a") : Color(hex: "#d9d1bf"))
+            Group {
+                stat("TODAY", String(format: "%.0f min · %.0f%%", model.todayMinutes, model.todayDose * 100))
+                stat("THIS WEEK", String(format: "%.1f h · %.0f%%", model.thisWeekHours, model.thisWeekDose * 100))
+                stat("LAST WEEK", String(format: "%.1f h · %.0f%%", model.lastWeekHours, model.lastWeekDose * 100))
+                stat("ROLLING 7 DAYS", String(format: "%.0f%% of WHO limit", model.weekDose * 100))
+                    .foregroundColor(model.weekDose >= 1 ? Color(hex: "#ff5a4a") : Color(hex: "#d9d1bf"))
+            }
             Spacer()
             field("Headphones", value: $model.sensitivity, unit: "dB SPL/V", width: 46)
             field("DAC", value: $model.dacVrms, unit: "Vrms", width: 40, decimals: 2)
