@@ -119,6 +119,10 @@ final class ListeningMeterModel: ObservableObject {
     @Published private(set) var shortDbA: Double = -.infinity    // last second
     @Published private(set) var leqDbA: Double = -.infinity      // last minute
     @Published private(set) var todayMinutes: Double = 0
+    // Doses are stored as fractions of the WHO *weekly* allowance (40 h at
+    // 80 dB(A)), so days add up directly to a week. "Today" is shown against
+    // a day's even share of that (1/7), i.e. ×7 — 100% means you've used a
+    // full day's worth; going over one day is fine if other days are lighter.
     @Published private(set) var todayDose: Double = 0            // fraction of WHO weekly allowance
     @Published private(set) var weekDose: Double = 0             // rolling last 7 days
     @Published private(set) var thisWeekHours: Double = 0        // calendar week, Mon–Sun
@@ -294,7 +298,19 @@ enum OutputVolume {
     /// Converts a volume-slider percentage to dB using the device's own
     /// volume curve when it reports one (most hardware volume controls do),
     /// otherwise assumes a linear amplitude scale.
+    private static var cache: [String: Double] = [:]
+
+    /// Cached: the result only changes with the volume setting or device, and
+    /// some devices log an "unknown property" error on every query.
     static func decibels(percent: Double, device: AudioDeviceID?) -> Double {
+        let key = "\(device ?? 0)-\(percent)"
+        if let hit = cache[key] { return hit }
+        let v = query(percent: percent, device: device)
+        cache[key] = v
+        return v
+    }
+
+    private static func query(percent: Double, device: AudioDeviceID?) -> Double {
         let scalar = Float32(max(0.0001, min(1, percent / 100)))
         if let device {
             for element in [kAudioObjectPropertyElementMain, 1] {
@@ -357,10 +373,10 @@ struct ListeningMeterBar: View {
                 .font(.system(size: 10, design: .monospaced)).foregroundColor(Color(hex: "#8f8778"))
             Divider().frame(height: 18)
             Group {
-                stat("TODAY", String(format: "%.0f min · %.0f%%", model.todayMinutes, model.todayDose * 100))
-                stat("THIS WEEK", String(format: "%.1f h · %.0f%%", model.thisWeekHours, model.thisWeekDose * 100))
-                stat("LAST WEEK", String(format: "%.1f h · %.0f%%", model.lastWeekHours, model.lastWeekDose * 100))
-                stat("ROLLING 7 DAYS", String(format: "%.0f%% of WHO limit", model.weekDose * 100))
+                stat("TODAY", String(format: "%.0f min · %.0f%% of day", model.todayMinutes, model.todayDose * 7 * 100))
+                stat("THIS WEEK", String(format: "%.1f h · %.0f%% of week", model.thisWeekHours, model.thisWeekDose * 100))
+                stat("LAST WEEK", String(format: "%.1f h · %.0f%% of week", model.lastWeekHours, model.lastWeekDose * 100))
+                stat("ROLLING 7 DAYS", String(format: "%.0f%% of WHO week", model.weekDose * 100))
                     .foregroundColor(model.weekDose >= 1 ? Color(hex: "#ff5a4a") : Color(hex: "#d9d1bf"))
             }
             Spacer()
@@ -370,7 +386,7 @@ struct ListeningMeterBar: View {
         }
         .padding(.horizontal, 16).padding(.vertical, 8)
         .background(Color(hex: "#1b1814"))
-        .help("Estimated level at your ears: headphone sensitivity + DAC output + system volume + EMP's A-weighted output. WHO guideline: 80 dB(A) for 40 h/week; each +3 dB halves the safe time.")
+        .help("Estimated level at your ears: headphone sensitivity + DAC output + system volume + EMP's A-weighted output. WHO guideline: 80 dB(A) for 40 h/week; each +3 dB halves the safe time. Today is shown against a day's share (1/7 of the week); weeks against the full weekly allowance.")
     }
 
     private func stat(_ title: String, _ value: String) -> some View {

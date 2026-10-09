@@ -11,7 +11,8 @@ final class PlaylistManager: ObservableObject {
     enum Order { case alpha, shuffle }
     var order: Order = .alpha { didSet { sort() } }
 
-    private let audioExts = Set(["mp3","m4a","aac","wav","flac","ogg","aiff","alac"])
+    // Formats AVAudioFile can decode (Ogg Vorbis isn't one on macOS).
+    private let audioExts = Set(["mp3","m4a","aac","wav","flac","aiff","aif","caf","alac"])
 
     var currentTrack: URL? { tracks.isEmpty ? nil : tracks[currentIndex] }
 

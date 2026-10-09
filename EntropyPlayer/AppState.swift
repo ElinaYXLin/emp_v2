@@ -32,6 +32,8 @@ final class AppState: ObservableObject {
     @Published var ranges: [String: RangeValue]  = ["reverb": .init(), "gd": .init(), "gdrand": .init(), "grain": .init(), "blur": .init(), "shimmer": .init(), "eq": .init(), "sat": .init(), "oddsat": .init(), "rolloff": .init(), "hyst": .init(), "sag": .init()]
     @Published var waveColor: Color = Color(hex: "#35d6d0")
     @Published var satRecipe: String = SaturatorRecipe.classic.name
+    @Published var isExporting = false
+    @Published var exportStatus: String? = nil
     @Published var selectedPreset: String = GlobalPreset.initName
     @Published var dynamicsMode: AudioEngine.DynamicsMode = .limiter
     @Published var macroMode: MacroMode = .manual
@@ -60,9 +62,8 @@ final class AppState: ObservableObject {
     /// Listening-level meter (bottom bar). System volume is converted with
     /// the current output device's own volume curve.
     lazy var meter = ListeningMeterModel(meter: audio.listeningMeter) { [weak self] pct in
-        let device = (self?.systemCaptureActive ?? false) ? self?.selectedOutputDeviceID
-                                                          : OutputVolume.defaultOutputDevice()
-        return OutputVolume.decibels(percent: pct, device: device)
+        // Both modes now play to the OUT device.
+        return OutputVolume.decibels(percent: pct, device: self?.selectedOutputDeviceID)
     }
 
     // MARK: Vibrato state
@@ -92,7 +93,8 @@ final class AppState: ObservableObject {
         inputDevices  = audio.listInputDevices()
         outputDevices = audio.listOutputDevices()
         selectedInputDeviceID  = inputDevices.first?.id
-        selectedOutputDeviceID = outputDevices.first?.id
+        selectedOutputDeviceID = preferredOutputDevice()
+        audio.setPlaybackOutputDevice(selectedOutputDeviceID)
     }
 
     // MARK: - System capture
@@ -131,7 +133,10 @@ final class AppState: ObservableObject {
 
     func switchCaptureDevice(input: AudioDeviceID? = nil, output: AudioDeviceID? = nil) {
         if let id = input  { selectedInputDeviceID  = id }
-        if let id = output { selectedOutputDeviceID = id }
+        if let id = output {
+            selectedOutputDeviceID = id
+            audio.setPlaybackOutputDevice(id)        // file playback follows OUT too
+        }
         guard systemCaptureActive,
               let inID  = selectedInputDeviceID,
               let outID = selectedOutputDeviceID else { return }
@@ -152,8 +157,24 @@ final class AppState: ObservableObject {
         }
         if let current = selectedOutputDeviceID,
            !outputDevices.contains(where: { $0.id == current }) {
-            selectedOutputDeviceID = outputDevices.first?.id
+            selectedOutputDeviceID = preferredOutputDevice()
+            audio.setPlaybackOutputDevice(selectedOutputDeviceID)
         }
+    }
+
+    /// The Mac's default output, unless that's a virtual loopback device
+    /// (BlackHole etc. — where System mode users point their Mac's output),
+    /// in which case the first real output device.
+    private func preferredOutputDevice() -> AudioDeviceID? {
+        func isVirtual(_ name: String) -> Bool {
+            ["BlackHole", "Loopback", "Soundflower", "Aggregate", "Teams Audio", "ZoomAudio", "WeMeet"]
+                .contains { name.localizedCaseInsensitiveContains($0) }
+        }
+        if let def = OutputVolume.defaultOutputDevice(),
+           let entry = outputDevices.first(where: { $0.id == def }), !isVirtual(entry.name) {
+            return def
+        }
+        return outputDevices.first { !isVirtual($0.name) }?.id ?? outputDevices.first?.id
     }
 
     // MARK: - Effective level computation
@@ -210,14 +231,13 @@ final class AppState: ObservableObject {
             audio.pause()
             isPlaying = false
         } else {
-            if playlist.currentTrack != nil {
-                audio.play()
-            } else {
-                if let url = playlist.tracks.first {
-                    loadAndPlay(url: url)
-                }
-            }
             isPlaying = true
+            if audio.hasLoadedTrack {
+                audio.play()
+            } else if let url = playlist.currentTrack ?? playlist.tracks.first {
+                // Freshly opened folder: nothing is loaded into the player yet.
+                loadAndPlay(url: url)
+            }
         }
     }
 
@@ -239,14 +259,13 @@ final class AppState: ObservableObject {
         if let i = playlist.tracks.firstIndex(of: url) {
             playlist.currentIndex = i
         }
-        loadAndPlay(url: url)
         isPlaying = true
+        loadAndPlay(url: url)
     }
 
     private func advanceTrack() {
         guard let url = playlist.next() else { return }
         loadAndPlay(url: url)
-        if isPlaying { audio.play() }
     }
 
     // MARK: - Waveform decoding (peaks for static display)

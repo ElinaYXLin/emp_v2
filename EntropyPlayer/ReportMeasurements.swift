@@ -19,7 +19,10 @@ import Foundation
 //                    centre time (energy's centre of gravity after arrival)
 
 struct ChainSettings {
+    var fileTrimDb = 0.0        // fixed local-file trim (export only)
     var preampDb = 0.0
+    var postGainDb = 0.0        // export only
+    var gdRandom = 0.0          // export only
     var eqDb = 0.0
     var evenDb = 0.0, oddDb = 0.0
     var recipe = SaturatorRecipe.classic

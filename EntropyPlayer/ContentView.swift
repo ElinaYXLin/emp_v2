@@ -43,8 +43,18 @@ struct ContentView: View {
             // Row 1
             HStack(spacing: 8) {
                 Button("Open") { app.playlist.openFolder() }.buttonStyle(EntBtn())
-                Button("Save") { app.audio.isPlaying ? nil : () /* no save feature in app */
-                }.buttonStyle(EntBtn())
+                Button(app.isExporting ? "Saving…" : "Save") { app.exportCurrentTrack() }
+                    .buttonStyle(EntBtn())
+                    .disabled(app.isExporting)
+                    .help("Render the current track through EMP's effects to a WAV file")
+                if let status = app.exportStatus {
+                    Text(status)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(Color(hex: "#8f8778"))
+                        .lineLimit(1)
+                        .frame(maxWidth: 180, alignment: .leading)
+                        .onTapGesture { if !app.isExporting { app.exportStatus = nil } }
+                }
                 searchField
                 Divider().frame(height: 22)
                 orderToggle
@@ -118,8 +128,8 @@ struct ContentView: View {
                         Button(action: {
                             if let idx = app.playlist.tracks.firstIndex(of: url) {
                                 app.playlist.currentIndex = idx
-                                app.loadAndPlay(url: url)
                                 app.isPlaying = true
+                                app.loadAndPlay(url: url)
                             }
                             app.playlist.searchQuery = ""
                         }) {

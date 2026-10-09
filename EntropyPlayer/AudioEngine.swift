@@ -123,6 +123,9 @@ final class AudioEngine {
     // loss — and pushed everything 7 dB hotter into the limiter.)
     private let preLimiterGainLinear: Float = pow(10, 7.0 / 20.0)
 
+    /// Fixed trim on local-file playback (see buildGraph). Also used by export.
+    static let fileTrimDb = -12.0
+
     // MARK: - Tap output
     var onSamples: (([Float]) -> Void)?
 
@@ -245,10 +248,13 @@ final class AudioEngine {
         // session is the correct recovery there, not restarting the main
         // engine's normal hardware I/O.
         guard !isSystemCapture else { return }
+        let wasPlaying = player.isPlaying
         engine.stop()
+        applyPlaybackOutputDevice()
         setLowLatency()
         do {
             try engine.start()
+            if wasPlaying { player.play() }
         } catch {
             // CoreAudio may still be settling right after a device change —
             // retry once more shortly rather than leaving the engine dead.
@@ -292,6 +298,11 @@ final class AudioEngine {
             engine.attach(n)
         }
         engine.connect(player, to: preampMixer, format: nil)
+        // Local files arrive at full mastered level, far hotter than System
+        // mode usually sees (BlackHole sources are typically turned down), so
+        // the same knobs clipped files much harder. A fixed trim puts files in
+        // the same ballpark; Pre-Amp then sets the drive from there.
+        player.volume = pow(10, Float(Self.fileTrimDb) / 20)
 
         // preampMixer's only downstream connection is this muted sink — it
         // keeps preampMixer part of the render graph (so its tap fires)
@@ -387,6 +398,35 @@ final class AudioEngine {
         listeningMeter.process(left: l, right: r, count: n)
     }
 
+    // MARK: - Playback output device
+    //
+    // File playback goes to the same OUT device chosen for System mode, not
+    // blindly to the Mac's default output — which, for anyone using System
+    // mode, is usually BlackHole: file playback then went silently into
+    // BlackHole instead of the headphones.
+
+    private var playbackOutputDevice: AudioDeviceID?
+
+    /// Routes file playback to `id` (restarting the engine if needed).
+    func setPlaybackOutputDevice(_ id: AudioDeviceID?) {
+        playbackOutputDevice = id
+        guard !isSystemCapture else { return }       // capture units own the output then
+        let wasRunning = engine.isRunning, wasPlaying = player.isPlaying
+        engine.stop()
+        applyPlaybackOutputDevice()
+        setLowLatency()
+        if wasRunning || currentFile != nil {
+            try? engine.start()
+            if wasPlaying { player.play() }
+        }
+    }
+
+    private func applyPlaybackOutputDevice() {
+        guard var dev = playbackOutputDevice, let au = engine.outputNode.audioUnit else { return }
+        AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                             &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+    }
+
     private func setLowLatency() {
         var devID = AudioDeviceID(kAudioObjectUnknown)
         var sz    = UInt32(MemoryLayout<AudioDeviceID>.size)
@@ -394,7 +434,11 @@ final class AudioEngine {
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope:    kAudioObjectPropertyScopeGlobal,
             mElement:  kAudioObjectPropertyElementMain)
-        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &prop, 0, nil, &sz, &devID)
+        if let chosen = playbackOutputDevice {
+            devID = chosen
+        } else {
+            AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &prop, 0, nil, &sz, &devID)
+        }
         guard devID != kAudioObjectUnknown else { return }
         var frames: UInt32 = 256
         prop.mSelector = kAudioDevicePropertyBufferFrameSize
@@ -656,7 +700,7 @@ final class AudioEngine {
     func startSystemCapture(inputDeviceID: AudioDeviceID, outputDeviceID: AudioDeviceID) throws {
         // ── Tear down any previous session; take the main engine offline ────
         stopCaptureUnits()
-        player.stop()
+        stopPlayer()
         engine.stop()
         captureRing.reset()
 
@@ -755,6 +799,7 @@ final class AudioEngine {
     func stopSystemCapture() {
         stopCaptureUnits()
         // ── Return the main engine to normal hardware output ──────────────────
+        applyPlaybackOutputDevice()
         try? engine.start()
     }
 
@@ -857,11 +902,27 @@ final class AudioEngine {
 
     // MARK: - Playback
 
+    /// Bumped whenever scheduled audio is abandoned. AVAudioPlayerNode fires a
+    /// segment's completion handler when the player is *stopped* too, not
+    /// just when it finishes — without this token, loading a track (which
+    /// stops the player) fired the previous track's "ended" callback, which
+    /// advanced to the next track, which stopped the player again… racing
+    /// through the whole folder.
+    private var scheduleGeneration = 0
+
+    private func stopPlayer() {
+        scheduleGeneration &+= 1
+        player.stop()
+    }
+
+    /// True once a file has been loaded and scheduled.
+    var hasLoadedTrack: Bool { currentFile != nil }
+
     func load(url: URL) throws {
         let file = try AVAudioFile(forReading: url)
         currentFile = file
         duration    = Double(file.length) / file.processingFormat.sampleRate
-        player.stop()
+        stopPlayer()
         schedule(file: file, from: 0)
         // In System mode the DSP chain belongs to the capture units; the main
         // engine stays offline until capture stops.
@@ -872,14 +933,21 @@ final class AudioEngine {
         scheduledStartSample = startFrame
         let remaining = AVAudioFrameCount(file.length - startFrame)
         guard remaining > 0 else { return }
-        player.scheduleSegment(file, startingFrame: startFrame, frameCount: remaining, at: nil) { [weak self] in
-            DispatchQueue.main.async { self?.onTrackEnded?() }
+        let generation = scheduleGeneration
+        player.scheduleSegment(file, startingFrame: startFrame, frameCount: remaining, at: nil,
+                               completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            DispatchQueue.main.async {
+                // Only a segment that actually played to the end advances the playlist.
+                guard let self, self.scheduleGeneration == generation, !self.isSystemCapture else { return }
+                self.scheduleGeneration &+= 1
+                self.onTrackEnded?()
+            }
         }
     }
 
     func play()  { player.play() }
     func pause() { player.pause() }
-    func stop()  { player.stop() }
+    func stop()  { stopPlayer() }
 
     var isPlaying: Bool { player.isPlaying }
 
